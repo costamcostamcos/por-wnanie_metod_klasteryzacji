@@ -529,7 +529,72 @@ def uruchom_dismea(X, liczba_grup, random_state=42):
 # GŁÓWNA LOGIKA APLIKACJI
 # ==========================================
 
+# ==========================================
+# AUTOMATYCZNE WYKRYWANIE USTAWIEŃ DANYCH
+# ==========================================
+_SLOWA_OSI = ('b', 'field', 'pole', 'gauss', 'mt', 'g', 'x', 'os', 'oś', 'ppm',
+              'index', 'indeks', 'channel', 'kanal', 'kanał', 'point', 'punkt',
+              'freq', 'czest', 'id', 'sample', 'probka', 'próbka', 'nr', 'no')
+
+def _czy_os_pomiarowa(seria):
+    """Czy wektor wygląda jak oś pomiarowa/indeks: ściśle monotoniczny
+    i (niemal) równomiernie rozłożony (stały krok)."""
+    v = pd.to_numeric(seria, errors='coerce').dropna().values
+    if len(v) < 3:
+        return False
+    diffs = np.diff(v)
+    if np.all(diffs > 0) or np.all(diffs < 0):
+        krok = np.abs(diffs)
+        cv = krok.std() / (krok.mean() + 1e-12)  # współczynnik zmienności kroku
+        return cv < 0.05
+    return False
+
+def wykryj_ustawienia_danych(df):
+    """Na podstawie surowego arkusza wykrywa: czy pominąć pierwszą kolumnę
+    (oś X / ID) oraz czy transponować (widma w kolumnach). Zwraca (pomin, transp, powody)."""
+    powody = []
+    n_wierszy, n_kolumn = df.shape
+
+    naglowek = str(df.columns[0]).strip().lower()
+    naglowek_ok = any(naglowek == s or naglowek.startswith(s) for s in _SLOWA_OSI)
+    kol_monotoniczna = _czy_os_pomiarowa(df.iloc[:, 0])
+    pomin = bool(kol_monotoniczna or naglowek_ok)
+
+    if kol_monotoniczna:
+        powody.append("pierwsza kolumna jest monotoniczna i równomierna → traktowana jako oś X / indeks")
+    elif naglowek_ok:
+        powody.append(f"nagłówek pierwszej kolumny ('{df.columns[0]}') wskazuje na oś lub identyfikator")
+    else:
+        powody.append("pierwsza kolumna zawiera dane widmowe → zachowana")
+
+    dane_kolumny = n_kolumn - (1 if pomin else 0)
+    # Oś pomiarowa (dużo punktów) powinna trafić do KOLUMN. Jeśli wierszy jest
+    # wyraźnie więcej niż kolumn danych, widma są prawdopodobnie w kolumnach.
+    if n_wierszy > dane_kolumny * 1.5:
+        transp = True
+        powody.append(f"{n_wierszy} wierszy > {dane_kolumny} kolumn danych → widma w kolumnach (transpozycja)")
+    else:
+        transp = False
+        powody.append(f"{dane_kolumny} kolumn danych ≥ {n_wierszy} wierszy → widma w wierszach (bez transpozycji)")
+
+    return pomin, transp, powody
+
+def sugeruj_limit_y(X):
+    """Robustowy górny limit osi Y: 99. percentyl wartości z zapasem, odporny na
+    pojedyncze wartości odstające. Zwraca 0.0 (= autoskalowanie) gdy brak sensownej granicy."""
+    vals = X[np.isfinite(X)]
+    if vals.size == 0:
+        return 0.0
+    gora = np.percentile(vals, 99.0)
+    if gora <= 0:
+        return 0.0
+    return float(round(gora * 1.15, 4))
+
 def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_kolumny):
+    try:
+        plik_excel.seek(0)
+    except Exception:
+        pass
     df = pd.read_excel(plik_excel, sheet_name=0)
     if pomin_kolumne: X_df = df.iloc[:, 1:]
     else: X_df = df
@@ -555,6 +620,10 @@ def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_ko
     df_gt_preview = None
     ostrzezenie_gt = None
     try:
+        try:
+            plik_excel.seek(0)
+        except Exception:
+            pass
         df_gt = pd.read_excel(plik_excel, sheet_name='Ground Truth')
         df_gt_preview = df_gt
         # Walidacja indeksu kolumny etykiet – wcześniej błąd był cicho połykany,
@@ -746,9 +815,22 @@ elif rodzina_algorytmow == "🔥 WSZYSTKIE NA RAZ (Globalny Ranking)":
 
 st.sidebar.markdown("---")
 st.sidebar.header("Ustawienia danych")
-pomin_kolumne = st.sidebar.checkbox("Zignoruj pierwszą kolumnę (np. oś X widma)", value=False)
-transpozycja = st.sidebar.checkbox("Transpozycja danych (widma w kolumnach)", value=False)
-limit_osi_y = st.sidebar.number_input("Limit osi Y na wykresach (0 = auto):", min_value=0.0, max_value=1000.0, value=0.25, step=0.05)
+tryb_ustawien_auto = st.sidebar.checkbox(
+    "🤖 Automatycznie dopasuj ustawienia danych",
+    value=True,
+    help="Aplikacja sama wykryje oś X w pierwszej kolumnie, orientację widm "
+         "(transpozycję) i zaproponuje limit osi Y. Odznacz, aby ustawić ręcznie."
+)
+
+# Wartości domyślne; w trybie auto zostaną nadpisane po wczytaniu pliku.
+pomin_kolumne, transpozycja, limit_osi_y = False, False, 0.25
+
+if not tryb_ustawien_auto:
+    pomin_kolumne = st.sidebar.checkbox("Zignoruj pierwszą kolumnę (np. oś X widma)", value=False)
+    transpozycja = st.sidebar.checkbox("Transpozycja danych (widma w kolumnach)", value=False)
+    limit_osi_y = st.sidebar.number_input("Limit osi Y na wykresach (0 = auto):", min_value=0.0, max_value=1000.0, value=0.25, step=0.05)
+else:
+    st.sidebar.caption("Ustawienia zostaną wykryte po wczytaniu pliku i pokazane w panelu głównym.")
 
 st.sidebar.markdown("---")
 st.sidebar.header("Ground Truth")
@@ -758,10 +840,32 @@ wgrany_plik = st.file_uploader("Wybierz plik Excel (.xlsx)", type=['xlsx'])
 
 if wgrany_plik is not None:
     try:
+        # W trybie automatycznym: wykryj ustawienia z surowego arkusza przed właściwym wczytaniem.
+        powody_detekcji = None
+        if tryb_ustawien_auto:
+            with st.spinner('Analiza struktury pliku...'):
+                wgrany_plik.seek(0)
+                df_surowy = pd.read_excel(wgrany_plik, sheet_name=0)
+                pomin_kolumne, transpozycja, powody_detekcji = wykryj_ustawienia_danych(df_surowy)
+                wgrany_plik.seek(0)
+
         with st.spinner('Wczytywanie i przygotowywanie danych...'):
+            wgrany_plik.seek(0)
             X, X_scaled, oryginalny_df, gt_labels, df_gt_preview, identyfikatory, ostrzezenie_gt = wczytaj_i_przygotuj_dane(
                 wgrany_plik, pomin_kolumne, transpozycja, gt_indeks
             )
+
+        # W trybie automatycznym limit osi Y liczymy z rzeczywistych danych.
+        if tryb_ustawien_auto:
+            limit_osi_y = sugeruj_limit_y(X)
+            limit_txt = "autoskalowanie (brak sztywnej granicy)" if limit_osi_y == 0.0 else f"{limit_osi_y}"
+            komunikat = "🤖 **Automatycznie dopasowane ustawienia:**\n"
+            komunikat += f"- Pominięcie pierwszej kolumny: **{'TAK' if pomin_kolumne else 'NIE'}**\n"
+            komunikat += f"- Transpozycja: **{'TAK' if transpozycja else 'NIE'}**\n"
+            komunikat += f"- Limit osi Y: **{limit_txt}**\n\n"
+            komunikat += "_Uzasadnienie:_ " + "; ".join(powody_detekcji)
+            komunikat += "\n\n_Jeśli wykrycie jest błędne, odznacz opcję automatycznego dopasowania w panelu bocznym i ustaw parametry ręcznie._"
+            st.info(komunikat)
 
         st.success(f"Dane wczytano! Główne dane: {X.shape[0]} widm, {X.shape[1]} punktów pomiarowych.")
 
