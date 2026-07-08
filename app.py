@@ -10,23 +10,19 @@ from sklearn.metrics import adjusted_rand_score
 
 st.set_page_config(page_title="Klasteryzacja Widm EPR", layout="wide")
 
-def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj):
+def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_kolumny):
     # Wczytanie głównego arkusza
     df = pd.read_excel(plik_excel, sheet_name=0)
     
-    # KROK 1: Usunięcie pierwszej kolumny (np. oś X widma) jeśli zaznaczono
     if pomin_kolumne:
         X_df = df.iloc[:, 1:]
     else:
         X_df = df
         
-    # KROK 2: Transpozycja (zamiana wierszy z kolumnami), jeśli widma są ułożone w kolumnach
     if transponuj:
         X_df = X_df.T
         
-    # KROK 3: Czyszczenie danych (odporność na '#REF!' i puste komórki)
     X_df = X_df.apply(pd.to_numeric, errors='coerce').fillna(0)
-    
     X = X_df.values
         
     scaler = StandardScaler()
@@ -34,13 +30,16 @@ def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj):
     
     # Wczytanie Ground Truth
     ground_truth_labels = None
+    df_gt_preview = None
     try:
         df_gt = pd.read_excel(plik_excel, sheet_name='Ground Truth')
-        ground_truth_labels = df_gt.iloc[:, 0].values 
-    except ValueError:
+        df_gt_preview = df_gt
+        # Wczytujemy kolumnę wybraną przez użytkownika (domyślnie 0 - pierwsza)
+        ground_truth_labels = df_gt.iloc[:, gt_indeks_kolumny].values 
+    except Exception:
         pass 
     
-    return X, X_scaled, df, ground_truth_labels
+    return X, X_scaled, df, ground_truth_labels, df_gt_preview
 
 def analizuj_widma_epr(X_scaled, liczba_grup, eps_dbscan, min_samples_dbscan):
     wyniki_klasteryzacji = {}
@@ -108,29 +107,45 @@ eps_dbscan = st.sidebar.slider("DBSCAN eps (promień):", min_value=0.1, max_valu
 min_samples_dbscan = st.sidebar.number_input("DBSCAN/OPTICS min_samples:", min_value=2, max_value=50, value=5)
 
 st.sidebar.markdown("---")
-st.sidebar.header("Ustawienia danych i wykresów")
+st.sidebar.header("Ustawienia danych głównego arkusza")
 pomin_kolumne = st.sidebar.checkbox("Zignoruj pierwszą kolumnę (np. oś X widma)", value=False)
-transpozycja = st.sidebar.checkbox("Transpozycja danych (zaznacz, jeśli widma są ułożone w kolumnach)", value=False)
+transpozycja = st.sidebar.checkbox("Transpozycja danych (widma w kolumnach)", value=False)
 limit_osi_y = st.sidebar.number_input("Maksymalna wartość osi Y (0 aby wyłączyć):", min_value=0.0, max_value=1000.0, value=0.25, step=0.05)
+
+st.sidebar.markdown("---")
+st.sidebar.header("Ustawienia Ground Truth")
+gt_indeks = st.sidebar.number_input("Która kolumna zawiera ETYKIETY klastrów? (0 = pierwsza, 1 = druga itd.):", min_value=0, max_value=10, value=0)
 
 wgrany_plik = st.file_uploader("Wybierz plik Excel (.xlsx)", type=['xlsx'])
 
 if wgrany_plik is not None:
     try:
         with st.spinner('Wczytywanie i skalowanie danych...'):
-            X, X_scaled, oryginalny_df, gt_labels = wczytaj_i_przygotuj_dane(wgrany_plik, pomin_kolumne, transpozycja)
+            X, X_scaled, oryginalny_df, gt_labels, df_gt_preview = wczytaj_i_przygotuj_dane(
+                wgrany_plik, pomin_kolumne, transpozycja, gt_indeks
+            )
             
-        st.success(f"Dane wczytano! Po przekształceniach mamy do analizy {X.shape[0]} widm (wierszy), a każde ma {X.shape[1]} punktów pomiarowych.")
+        st.success(f"Dane wczytano! Główne dane: {X.shape[0]} widm, {X.shape[1]} punktów.")
         
         if gt_labels is not None:
-            st.info(f"✅ Wykryto arkusz 'Ground Truth' z {len(gt_labels)} etykietami. Ewaluacja zostanie przeprowadzona.")
+            st.info(f"✅ Wykryto arkusz 'Ground Truth'.")
+            with st.expander("Kliknij, aby rozwinąć PODGLĄD GROUND TRUTH (Sprawdź, czy etykiety są poprawne!)"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Wygląd całego arkusza Ground Truth:**")
+                    st.dataframe(df_gt_preview.head(10))
+                with col2:
+                    st.markdown(f"**Co odczytano jako etykiety (Kolumna {gt_indeks}):**")
+                    st.write(gt_labels[:10])
+                    st.markdown(f"*Liczba unikalnych etykiet: {len(np.unique(gt_labels))}*")
+                    if len(np.unique(gt_labels)) > 20:
+                        st.error("⚠️ UWAGA! Wykryto bardzo dużo unikalnych etykiet. Prawdopodobnie wczytałeś kolumnę z nazwami próbek zamiast z numerami klastrów. Zmień indeks kolumny w panelu bocznym!")
         else:
             st.warning("⚠️ Brak arkusza 'Ground Truth'. Ewaluacja pominęta.")
         
         if st.button("Uruchom Klasteryzację", type="primary"):
-            # Zabezpieczenie przed błędem z wymiarami
             if gt_labels is not None and len(gt_labels) != X.shape[0]:
-                st.error(f"❌ Błąd zgodności! Twoje Ground Truth ma etykiety dla {len(gt_labels)} widm, ale główny arkusz ma {X.shape[0]} wierszy analizy. Zmień ustawienie opcji 'Transpozycja danych' lub 'Zignoruj pierwszą kolumnę' w panelu bocznym!")
+                st.error(f"❌ Błąd zgodności! Ground Truth ma etykiety dla {len(gt_labels)} widm, a główny arkusz ma {X.shape[0]}.")
             else:
                 with st.spinner('Trwa obliczanie klastrów i ewaluacja...'):
                     wyniki = analizuj_widma_epr(X_scaled, liczba_grup, eps_dbscan, min_samples_dbscan)
@@ -138,8 +153,7 @@ if wgrany_plik is not None:
                     wyniki_ewaluacji = []
                     
                     for nazwa_algorytmu, etykiety in wyniki.items():
-                        # Jeśli użyto transpozycji, musimy ostrożnie dopisać wyniki, żeby nie zepsuć oryginalnego dataframe
-                        oryginalny_df[f'Klaster_{nazwa_algorytmu}'] = "Zapis w nowym arkuszu" # Placeholder
+                        oryginalny_df[f'Klaster_{nazwa_algorytmu}'] = "Zapis w nowym arkuszu"
                         
                         fig = generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_osi_y)
                         wykresy[nazwa_algorytmu] = fig
@@ -155,7 +169,6 @@ if wgrany_plik is not None:
                         st.subheader("Wyniki Ewaluacji (porównanie z Ground Truth)")
                         df_ewaluacja = pd.DataFrame(wyniki_ewaluacji).sort_values(by="ARI (Adjusted Rand Index)", ascending=False)
                         st.dataframe(df_ewaluacja, use_container_width=True)
-                        st.markdown("*Wskaźnik ARI: 1.0 oznacza idealne pokrycie z Ground Truth, 0.0 oznacza wynik losowy.*")
     
                     st.subheader("Wizualizacja średnich widm w klastrach")
                     for nazwa, fig in wykresy.items():
@@ -163,7 +176,6 @@ if wgrany_plik is not None:
                 
                 bufor = io.BytesIO()
                 with pd.ExcelWriter(bufor, engine='xlsxwriter') as writer:
-                    # Zapis przetransformowanych wyników 
                     wyniki_df = pd.DataFrame(X)
                     for algorytm, etyk in wyniki.items():
                         wyniki_df[f'Klaster_{algorytm}'] = etyk
@@ -184,7 +196,7 @@ if wgrany_plik is not None:
                         wiersz_start += 28
     
                 st.download_button(
-                    label="⬇️ Pobierz plik Excel (Dane + Ewaluacja + Wykresy)",
+                    label="⬇️ Pobierz plik Excel",
                     data=bufor.getvalue(),
                     file_name="sklasyfikowane_widma.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
