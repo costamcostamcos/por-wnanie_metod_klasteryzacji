@@ -6,20 +6,19 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import adjusted_rand_score, pairwise_distances
 from sklearn.neighbors import KernelDensity
+from sklearn.decomposition import PCA
 
-# Algorytmy Partycjonujące (Tabela 2)
-from sklearn.cluster import KMeans
+# Algorytmy Partycjonujące i Gęstościowe
+from sklearn.cluster import KMeans, DBSCAN, OPTICS, MeanShift, AgglomerativeClustering
 from sklearn_extra.cluster import KMedoids
-
-# Algorytmy Gęstościowe (Tabela 3)
-from sklearn.cluster import DBSCAN, OPTICS, MeanShift
 import scipy.sparse as sp
 from scipy.sparse.csgraph import connected_components
+from scipy.ndimage import gaussian_filter, maximum_filter
 
 st.set_page_config(page_title="Klasteryzacja Widm EPR", layout="wide")
 
 # ==========================================
-# NATYWNE IMPLEMENTACJE - TABELA 2
+# NATYWNE IMPLEMENTACJE - TABELA 2 (Partycjonujące)
 # ==========================================
 def uruchom_clara(X, liczba_grup, random_state=42):
     np.random.seed(random_state)
@@ -79,47 +78,32 @@ def uruchom_clarans(X, liczba_grup, numlocal=3, maxneighbor=5, random_state=42):
     return labels
 
 # ==========================================
-# NATYWNE IMPLEMENTACJE - TABELA 3
+# NATYWNE IMPLEMENTACJE - TABELA 3 (Gęstościowe)
 # ==========================================
 def uruchom_denclue(X, bandwidth=0.5, threshold=0.05):
-    """Natywna implementacja DENCLUE wykorzystująca Kernel Density Estimation (KDE)."""
-    # 1. Estymacja gęstości przestrzennej dla każdego punktu
     kde = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(X)
-    log_dens = kde.score_samples(X)
-    dens = np.exp(log_dens)
-    
-    # 2. Odfiltrowanie szumu (punkty poniżej progu gęstości)
+    dens = np.exp(kde.score_samples(X))
     core_mask = dens > threshold
-    labels = np.full(X.shape[0], -1) # Domyślnie szum
+    labels = np.full(X.shape[0], -1) 
     
     if np.sum(core_mask) > 0:
-        X_core = X[core_mask]
-        dist_matrix = pairwise_distances(X_core)
-        # 3. Łączenie gęstych obszarów (Atraktorów)
+        dist_matrix = pairwise_distances(X[core_mask])
         adj_matrix = (dist_matrix <= bandwidth).astype(int)
         n_components, labels_core = connected_components(csgraph=sp.csr_matrix(adj_matrix), directed=False)
         labels[core_mask] = labels_core
-        
     return labels
 
 def uruchom_rdbc(X, eps=0.5, min_samples=5):
-    """Natywna implementacja RDBC (Reachability Distance Based Clustering)."""
     dist_matrix = pairwise_distances(X)
-    n = X.shape[0]
-    
-    # Punkty rdzeniowe
     adj = (dist_matrix <= eps).astype(int)
     core_points = np.sum(adj, axis=1) >= min_samples
-    
-    labels = np.full(n, -1)
+    labels = np.full(X.shape[0], -1)
     if np.sum(core_points) > 0:
         adj_core = adj[core_points][:, core_points]
         n_components, labels_core = connected_components(csgraph=sp.csr_matrix(adj_core), directed=False)
         labels[core_points] = labels_core
-        
-        # Przypisanie punktów brzegowych do najbliższego rdzenia
         core_indices = np.where(core_points)[0]
-        for i in range(n):
+        for i in range(X.shape[0]):
             if not core_points[i]:
                 distances_to_cores = dist_matrix[i, core_indices]
                 min_dist_idx = np.argmin(distances_to_cores)
@@ -128,12 +112,112 @@ def uruchom_rdbc(X, eps=0.5, min_samples=5):
     return labels
 
 # ==========================================
+# NATYWNE IMPLEMENTACJE - TABELA 4 (Siatkowe)
+# ==========================================
+def pca_grid_base(X, bins=15):
+    """Pomocnicza redukcja wymiarów do 2D, niezbędna dla algorytmów siatkowych."""
+    if X.shape[1] >= 2:
+        X_pca = PCA(n_components=2, random_state=42).fit_transform(X)
+    else:
+        X_pca = np.column_stack((X, np.zeros_like(X))) # Fallback
+
+    X_min, X_max = X_pca.min(axis=0), X_pca.max(axis=0)
+    X_norm = (X_pca - X_min) / (X_max - X_min + 1e-9)
+    coords = np.floor(X_norm * bins).astype(int)
+    coords = np.clip(coords, 0, bins - 1)
+    flat_coords = coords[:, 0] * bins + coords[:, 1]
+    grid_2d = np.bincount(flat_coords, minlength=bins*bins).reshape((bins, bins))
+    return coords, flat_coords, grid_2d
+
+def uruchom_sting(X, bins=15):
+    coords, flat_coords, grid_2d = pca_grid_base(X, bins)
+    threshold = (X.shape[0] / (bins*bins)) * 0.5 # Średnia gęstość jako próg
+    dense_cells = np.argwhere(grid_2d > threshold)
+    if len(dense_cells) == 0: return np.full(X.shape[0], -1)
+    
+    # Łączenie sąsiadujących gęstych komórek
+    cell_labels = DBSCAN(eps=1.5, min_samples=1).fit_predict(dense_cells)
+    flat_to_label = np.full(bins*bins, -1)
+    for idx, (i, j) in enumerate(dense_cells): flat_to_label[i * bins + j] = cell_labels[idx]
+    return flat_to_label[flat_coords]
+
+def uruchom_clique(X, bins=15):
+    coords, flat_coords, grid_2d = pca_grid_base(X, bins)
+    c0 = np.bincount(coords[:, 0], minlength=bins)
+    c1 = np.bincount(coords[:, 1], minlength=bins)
+    
+    t0, t1 = np.mean(c0), np.mean(c1)
+    labels = np.full(X.shape[0], -1)
+    cluster_id = 0
+    # Przecinanie gęstych podprzestrzeni (1D z 1D = 2D)
+    for i in np.where(c0 > t0)[0]:
+        for j in np.where(c1 > t1)[0]:
+            mask = (coords[:, 0] == i) & (coords[:, 1] == j)
+            if np.any(mask):
+                labels[mask] = cluster_id
+                cluster_id += 1
+    return labels
+
+def uruchom_optigrid(X, bins=15):
+    coords, flat_coords, grid_2d = pca_grid_base(X, bins)
+    c0 = np.bincount(coords[:, 0], minlength=bins)
+    c1 = np.bincount(coords[:, 1], minlength=bins)
+    
+    # Cięcie w miejscach o najmniejszej gęstości (doliny)
+    cut0, cut1 = np.argmin(c0), np.argmin(c1)
+    labels = np.zeros(X.shape[0], dtype=int)
+    labels[coords[:, 0] > cut0] += 1
+    labels[coords[:, 1] > cut1] += 2
+    return labels
+
+def uruchom_gridclus(X, bins=15):
+    coords, flat_coords, grid_2d = pca_grid_base(X, bins)
+    populated = np.argwhere(grid_2d > 0)
+    if len(populated) < 2: return np.zeros(X.shape[0])
+    
+    # Aglomeracyjne grupowanie bloków siatki
+    cell_labels = AgglomerativeClustering(n_clusters=min(3, len(populated))).fit_predict(populated)
+    flat_to_label = np.full(bins*bins, -1)
+    for idx, (i, j) in enumerate(populated): flat_to_label[i * bins + j] = cell_labels[idx]
+    return flat_to_label[flat_coords]
+
+def uruchom_gdilc(X, bins=15):
+    coords, flat_coords, grid_2d = pca_grid_base(X, bins)
+    
+    # Poszukiwanie izolinii szczytowych (lokalne maksima)
+    local_max = maximum_filter(grid_2d, size=3) == grid_2d
+    peaks = np.argwhere(local_max & (grid_2d > 0))
+    if len(peaks) == 0: return np.full(X.shape[0], -1)
+    
+    populated = np.argwhere(grid_2d > 0)
+    # Przypisanie komórek do najbliższych szczytów gęstości (gradient ascent)
+    from sklearn.metrics import pairwise_distances_argmin
+    cell_labels = pairwise_distances_argmin(populated, peaks)
+    
+    flat_to_label = np.full(bins*bins, -1)
+    for idx, (i, j) in enumerate(populated): flat_to_label[i * bins + j] = cell_labels[idx]
+    return flat_to_label[flat_coords]
+
+def uruchom_wavecluster(X, bins=15):
+    coords, flat_coords, grid_2d = pca_grid_base(X, bins)
+    
+    # Transformata falkowa przybliżona filtrem Gaussa (low-pass)
+    blurred = gaussian_filter(grid_2d.astype(float), sigma=1.0)
+    dense_cells = np.argwhere(blurred > np.mean(blurred))
+    if len(dense_cells) == 0: return np.full(X.shape[0], -1)
+    
+    cell_labels = DBSCAN(eps=1.5, min_samples=1).fit_predict(dense_cells)
+    flat_to_label = np.full(bins*bins, -1)
+    for idx, (i, j) in enumerate(dense_cells): flat_to_label[i * bins + j] = cell_labels[idx]
+    return flat_to_label[flat_coords]
+
+
+# ==========================================
 # GŁÓWNA LOGIKA APLIKACJI
 # ==========================================
 
 def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_kolumny):
     df = pd.read_excel(plik_excel, sheet_name=0)
-    
     if pomin_kolumne: X_df = df.iloc[:, 1:]
     else: X_df = df
         
@@ -173,10 +257,19 @@ def analizuj_gestosciowe(X_scaled, eps, min_samples, bandwidth):
     wyniki = {}
     wyniki['DBSCAN'] = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(X_scaled)
     wyniki['OPTICS'] = OPTICS(min_samples=min_samples).fit_predict(X_scaled)
-    # Mean-Shift nie wymaga z góry podanej liczby klastrów, korzysta z szerokości pasma (bandwidth)
     wyniki['Mean-Shift'] = MeanShift(bandwidth=bandwidth).fit_predict(X_scaled)
     wyniki['DENCLUE'] = uruchom_denclue(X_scaled, bandwidth=bandwidth, threshold=0.01)
     wyniki['RDBC'] = uruchom_rdbc(X_scaled, eps=eps, min_samples=min_samples)
+    return wyniki
+
+def analizuj_siatkowe(X_scaled, bins):
+    wyniki = {}
+    wyniki['STING'] = uruchom_sting(X_scaled, bins=bins)
+    wyniki['CLIQUE'] = uruchom_clique(X_scaled, bins=bins)
+    wyniki['OptiGrid'] = uruchom_optigrid(X_scaled, bins=bins)
+    wyniki['GRIDCLUS'] = uruchom_gridclus(X_scaled, bins=bins)
+    wyniki['GDILC'] = uruchom_gdilc(X_scaled, bins=bins)
+    wyniki['WaveCluster'] = uruchom_wavecluster(X_scaled, bins=bins)
     return wyniki
 
 def generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_y=None):
@@ -216,10 +309,10 @@ def generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_y=None):
 # --- INTERFEJS STREAMLIT ---
 st.title("🔬 Analiza i Klasteryzacja Widm EPR")
 
-st.sidebar.header("Wybór Metodyologii")
+st.sidebar.header("Wybór Metodologii")
 rodzina_algorytmow = st.sidebar.radio(
     "Którą rodzinę algorytmów chcesz uruchomić?",
-    ("Partycjonujące (Tab 2)", "Oparte na Gęstości (Tab 3)")
+    ("Partycjonujące (Tab 2)", "Oparte na Gęstości (Tab 3)", "Oparte na Siatce (Tab 4)")
 )
 
 st.sidebar.markdown("---")
@@ -227,11 +320,14 @@ st.sidebar.header("Parametry algorytmów")
 
 if rodzina_algorytmow == "Partycjonujące (Tab 2)":
     liczba_grup = st.sidebar.number_input("Liczba klastrów (K):", min_value=2, max_value=20, value=3)
-else:
+elif rodzina_algorytmow == "Oparte na Gęstości (Tab 3)":
     st.sidebar.markdown("*Uwaga: Metody gęstościowe same znajdują optymalną liczbę klastrów.*")
     eps_val = st.sidebar.slider("Promień poszukiwań (eps) - DBSCAN/RDBC:", min_value=0.1, max_value=20.0, value=5.0, step=0.1)
     min_samples_val = st.sidebar.number_input("Minimalna liczba punktów (min_samples) - DBSCAN/OPTICS:", min_value=2, max_value=50, value=3)
     bandwidth_val = st.sidebar.slider("Szerokość pasma (bandwidth) - Mean-Shift/DENCLUE:", min_value=0.1, max_value=20.0, value=2.0, step=0.1)
+else:
+    st.sidebar.markdown("*Metody siatkowe redukują wymiarowość widm (PCA) i dzielą przestrzeń na bloki.*")
+    bins_val = st.sidebar.slider("Rozdzielczość siatki (liczba komórek na oś):", min_value=5, max_value=50, value=15)
 
 st.sidebar.markdown("---")
 st.sidebar.header("Ustawienia danych głównego arkusza")
@@ -272,8 +368,10 @@ if wgrany_plik is not None:
                     
                     if rodzina_algorytmow == "Partycjonujące (Tab 2)":
                         wyniki = analizuj_partycjonujace(X_scaled, liczba_grup)
-                    else:
+                    elif rodzina_algorytmow == "Oparte na Gęstości (Tab 3)":
                         wyniki = analizuj_gestosciowe(X_scaled, eps_val, min_samples_val, bandwidth_val)
+                    else:
+                        wyniki = analizuj_siatkowe(X_scaled, bins_val)
                         
                     wykresy = {}
                     wyniki_ewaluacji = []
