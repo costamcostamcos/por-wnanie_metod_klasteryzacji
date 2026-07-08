@@ -4,11 +4,13 @@ import numpy as np
 import io
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans, Birch, AgglomerativeClustering, DBSCAN, OPTICS, MeanShift
+from sklearn.cluster import KMeans
 from sklearn_extra.cluster import KMedoids
 from sklearn.metrics import adjusted_rand_score
+from pyclustering.cluster.clara import clara
+from pyclustering.cluster.clarans import clarans
 
-st.set_page_config(page_title="Klasteryzacja Widm EPR", layout="wide")
+st.set_page_config(page_title="Klasteryzacja Widm EPR - Metody Partycjonujące", layout="wide")
 
 def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_kolumny):
     df = pd.read_excel(plik_excel, sheet_name=0)
@@ -20,10 +22,8 @@ def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_ko
         
     if transponuj:
         X_df = X_df.T
-        # Po transpozycji indeksy (dawne nagłówki kolumn) stają się nazwami widm
         identyfikatory_widm = X_df.index.astype(str).tolist()
     else:
-        # Jeśli nie ma transpozycji, ale usunęliśmy 1. kolumnę, uznajemy ją za ID próbek
         if pomin_kolumne:
             identyfikatory_widm = df.iloc[:, 0].astype(str).tolist()
         else:
@@ -46,29 +46,49 @@ def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_ko
     
     return X, X_scaled, df, ground_truth_labels, df_gt_preview, identyfikatory_widm
 
-def analizuj_widma_epr(X_scaled, liczba_grup, eps_dbscan, min_samples_dbscan):
+def analizuj_widma_epr(X_scaled, liczba_grup):
     wyniki_klasteryzacji = {}
     
-    slink = AgglomerativeClustering(n_clusters=liczba_grup, linkage='single')
-    wyniki_klasteryzacji['SLINK'] = slink.fit_predict(X_scaled)
-    
-    birch = Birch(n_clusters=liczba_grup)
-    wyniki_klasteryzacji['BIRCH'] = birch.fit_predict(X_scaled)
-
+    # 1. K-Means
     kmeans = KMeans(n_clusters=liczba_grup, random_state=42)
     wyniki_klasteryzacji['K-Means'] = kmeans.fit_predict(X_scaled)
     
+    # 2. K-Medoids (standardowa metoda alternatywna wg implementacji sklearn_extra)
+    kmedoids = KMedoids(n_clusters=liczba_grup, method='alternate', random_state=42)
+    wyniki_klasteryzacji['K-Medoids'] = kmedoids.fit_predict(X_scaled)
+
+    # 3. PAM (Partitioning Around Medoids)
     pam = KMedoids(n_clusters=liczba_grup, method='pam', random_state=42)
     wyniki_klasteryzacji['PAM'] = pam.fit_predict(X_scaled)
     
-    dbscan = DBSCAN(eps=eps_dbscan, min_samples=min_samples_dbscan)
-    wyniki_klasteryzacji['DBSCAN'] = dbscan.fit_predict(X_scaled)
+    # Przygotowanie danych dla biblioteki pyclustering (wymaga formatu listy list)
+    dane_pyclustering = X_scaled.tolist()
     
-    optics = OPTICS(min_samples=min_samples_dbscan)
-    wyniki_klasteryzacji['OPTICS'] = optics.fit_predict(X_scaled)
+    # 4. CLARA
+    # Parametr 'number_samples' określa rozmiar podpróbki. Zazwyczaj 40 + 2*k jest dobrym punktem wyjścia.
+    rozmiar_probki_clara = min(len(dane_pyclustering), 40 + 2 * liczba_grup)
+    clara_instance = clara(dane_pyclustering, liczba_grup, rozmiar_probki_clara)
+    clara_instance.process()
+    clara_clusters = clara_instance.get_clusters()
     
-    meanshift = MeanShift()
-    wyniki_klasteryzacji['Mean-Shift'] = meanshift.fit_predict(X_scaled)
+    # Konwersja formatu pyclustering na płaską tablicę etykiet (taką jak ze sklearn)
+    etykiety_clara = np.zeros(X_scaled.shape[0], dtype=int)
+    for id_klastra, klaster in enumerate(clara_clusters):
+        for id_punktu in klaster:
+            etykiety_clara[id_punktu] = id_klastra
+    wyniki_klasteryzacji['CLARA'] = etykiety_clara
+
+    # 5. CLARANS
+    # Parametry numlocal i maxneighbor determinują dokładność i czas działania. Ustawiamy stabilne domyślne.
+    clarans_instance = clarans(dane_pyclustering, liczba_grup, numlocal=3, maxneighbor=4)
+    clarans_instance.process()
+    clarans_clusters = clarans_instance.get_clusters()
+    
+    etykiety_clarans = np.zeros(X_scaled.shape[0], dtype=int)
+    for id_klastra, klaster in enumerate(clarans_clusters):
+        for id_punktu in klaster:
+            etykiety_clarans[id_punktu] = id_klastra
+    wyniki_klasteryzacji['CLARANS'] = etykiety_clarans
 
     return wyniki_klasteryzacji
 
@@ -84,7 +104,7 @@ def generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_y=None):
             continue
             
         srednie_widmo = np.mean(X[maska], axis=0)
-        odchylenie = np.std(X[maska], axis=0) # Obliczanie błędu (odchylenia standardowego)
+        odchylenie = np.std(X[maska], axis=0)
         
         if etykieta == -1:
             line = ax.plot(os_x, srednie_widmo, color='gray', linestyle='--', label=f'Szum (-1) [n={liczba_widm}]')
@@ -92,7 +112,6 @@ def generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_y=None):
         else:
             line = ax.plot(os_x, srednie_widmo, label=f'Klaster {etykieta} [n={liczba_widm}]')
             kolor = line[0].get_color()
-            # Rysowanie wstęgi błędu wokół średniej
             ax.fill_between(os_x, srednie_widmo - odchylenie, srednie_widmo + odchylenie, color=kolor, alpha=0.2)
             
     ax.set_title(f'Średnia reprezentacja klastrów: {nazwa_algorytmu} (wstęga = $\pm$1 odchylenie std)')
@@ -111,43 +130,42 @@ def generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_y=None):
     return fig
 
 # --- INTERFEJS STREAMLIT ---
-st.title("🔬 Analiza i Klasteryzacja Widm EPR")
+st.title("🔬 Analiza i Klasteryzacja Widm EPR (Metody Partycjonujące)")
+st.markdown("Algorytmy: **K-means, K-medoids, PAM, CLARA, CLARANS**")
 
 st.sidebar.header("Parametry algorytmów")
-liczba_grup = st.sidebar.number_input("Liczba klastrów (K-Means, PAM, Birch, SLINK):", min_value=2, max_value=20, value=3)
-eps_dbscan = st.sidebar.slider("DBSCAN eps (promień):", min_value=0.1, max_value=10.0, value=0.5, step=0.1)
-min_samples_dbscan = st.sidebar.number_input("DBSCAN/OPTICS min_samples:", min_value=2, max_value=50, value=5)
+liczba_grup = st.sidebar.number_input("Liczba klastrów (K):", min_value=2, max_value=20, value=3)
 
 st.sidebar.markdown("---")
 st.sidebar.header("Ustawienia danych głównego arkusza")
 pomin_kolumne = st.sidebar.checkbox("Zignoruj pierwszą kolumnę (np. oś X widma)", value=False)
 transpozycja = st.sidebar.checkbox("Transpozycja danych (widma w kolumnach)", value=False)
-limit_osi_y = st.sidebar.number_input("Maksymalna wartość osi Y (0 aby wyłączyć):", min_value=0.0, max_value=1000.0, value=0.25, step=0.05)
+limit_osi_y = st.sidebar.number_input("Maksymalna wartość osi Y na wykresach (0 = auto):", min_value=0.0, max_value=1000.0, value=0.25, step=0.05)
 
 st.sidebar.markdown("---")
 st.sidebar.header("Ustawienia Ground Truth")
-gt_indeks = st.sidebar.number_input("Która kolumna zawiera ETYKIETY klastrów? (0 = pierwsza, 1 = druga itd.):", min_value=0, max_value=10, value=0)
+gt_indeks = st.sidebar.number_input("Indeks kolumny z etykietami klastrów (0 = pierwsza):", min_value=0, max_value=10, value=0)
 
 wgrany_plik = st.file_uploader("Wybierz plik Excel (.xlsx)", type=['xlsx'])
 
 if wgrany_plik is not None:
     try:
-        with st.spinner('Wczytywanie i skalowanie danych...'):
+        with st.spinner('Wczytywanie i przygotowywanie danych...'):
             X, X_scaled, oryginalny_df, gt_labels, df_gt_preview, identyfikatory = wczytaj_i_przygotuj_dane(
                 wgrany_plik, pomin_kolumne, transpozycja, gt_indeks
             )
             
-        st.success(f"Dane wczytano! Główne dane: {X.shape[0]} widm, {X.shape[1]} punktów.")
+        st.success(f"Dane wczytano! Główne dane: {X.shape[0]} widm, {X.shape[1]} punktów pomiarowych.")
         
         if gt_labels is not None:
             st.info("✅ Wykryto arkusz 'Ground Truth'.")
-            with st.expander("Kliknij, aby rozwinąć PODGLĄD GROUND TRUTH (Sprawdź, czy etykiety są poprawne!)"):
+            with st.expander("Kliknij, aby rozwinąć PODGLĄD GROUND TRUTH (Sprawdź poprawność etykiet)"):
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.markdown("**Wygląd całego arkusza Ground Truth:**")
+                    st.markdown("**Cały arkusz Ground Truth:**")
                     st.dataframe(df_gt_preview.head(10))
                 with col2:
-                    st.markdown(f"**Co odczytano jako etykiety (Kolumna {gt_indeks}):**")
+                    st.markdown(f"**Etykiety wczytane z kolumny {gt_indeks}:**")
                     st.write(gt_labels[:10])
                     st.markdown(f"*Liczba unikalnych etykiet: {len(np.unique(gt_labels))}*")
                     if len(np.unique(gt_labels)) > 20:
@@ -155,24 +173,22 @@ if wgrany_plik is not None:
         
         if st.button("Uruchom Klasteryzację", type="primary"):
             if gt_labels is not None and len(gt_labels) != X.shape[0]:
-                st.error(f"❌ Błąd zgodności! Ground Truth ma etykiety dla {len(gt_labels)} widm, a główny arkusz ma {X.shape[0]}.")
+                st.error(f"❌ Błąd zgodności! Ground Truth (ilość: {len(gt_labels)}) nie pasuje do badanych widm ({X.shape[0]}).")
             else:
-                with st.spinner('Trwa obliczanie klastrów i ewaluacja...'):
-                    wyniki = analizuj_widma_epr(X_scaled, liczba_grup, eps_dbscan, min_samples_dbscan)
+                with st.spinner('Trwa obliczanie klastrów (CLARANS może chwilę potrwać) i ewaluacja...'):
+                    wyniki = analizuj_widma_epr(X_scaled, liczba_grup)
                     wykresy = {}
                     wyniki_ewaluacji = []
                     
-                    st.subheader("Skład poszczególnych klastrów (które widma trafiły gdzie)")
+                    st.subheader("Skład poszczególnych klastrów")
                     
                     for nazwa_algorytmu, etykiety in wyniki.items():
-                        # Generowanie tekstu z przypisaniami widm do interfejsu
                         with st.expander(f"Rozkład widm: {nazwa_algorytmu}"):
                             unikalne = np.unique(etykiety)
                             for etyk in unikalne:
                                 indeksy_w_klastrze = np.where(etykiety == etyk)[0]
                                 id_widm_w_klastrze = [identyfikatory[i] for i in indeksy_w_klastrze]
-                                nazwa_kategorii = f"Klaster {etyk}" if etyk != -1 else "Szum (-1)"
-                                st.markdown(f"**{nazwa_kategorii}** (Sztuk: {len(indeksy_w_klastrze)}): {', '.join(id_widm_w_klastrze)}")
+                                st.markdown(f"**Klaster {etyk}** (Sztuk: {len(indeksy_w_klastrze)}): {', '.join(id_widm_w_klastrze)}")
                         
                         fig = generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_osi_y)
                         wykresy[nazwa_algorytmu] = fig
@@ -196,7 +212,6 @@ if wgrany_plik is not None:
                 bufor = io.BytesIO()
                 with pd.ExcelWriter(bufor, engine='xlsxwriter') as writer:
                     wyniki_df = pd.DataFrame(X)
-                    # Odtwarzamy oryginalne nazwy kolumn jeśli była transpozycja
                     if transpozycja:
                         wyniki_df.index = identyfikatory
                     
@@ -219,9 +234,9 @@ if wgrany_plik is not None:
                         wiersz_start += 28
     
                 st.download_button(
-                    label="⬇️ Pobierz plik Excel",
+                    label="⬇️ Pobierz plik Excel (Wyniki)",
                     data=bufor.getvalue(),
-                    file_name="sklasyfikowane_widma.xlsx",
+                    file_name="sklasyfikowane_widma_partycjonujace.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             
