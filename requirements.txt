@@ -1,6 +1,6 @@
 streamlit
 pandas
-numpy<2.0.0
-scikit-learn<1.3.0
-scikit-learn-extra
-openpyxl
+numpy
+scikit-learn
+matplotlib
+xlsxwriter
