@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import io
+import traceback
+import matplotlib
+matplotlib.use("Agg")  # backend bez GUI – bezpieczny w Streamlit i przy zapisie do Excela
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import adjusted_rand_score, pairwise_distances
@@ -11,10 +14,92 @@ from sklearn.mixture import GaussianMixture
 
 # Algorytmy Partycjonujące i Gęstościowe
 from sklearn.cluster import KMeans, DBSCAN, OPTICS, MeanShift, AgglomerativeClustering
-from sklearn_extra.cluster import KMedoids
 import scipy.sparse as sp
 from scipy.sparse.csgraph import connected_components
 from scipy.ndimage import gaussian_filter, maximum_filter
+
+# ==========================================
+# BEZPIECZNY IMPORT KMEDOIDS
+# scikit-learn-extra (0.3.0, marzec 2023) jest niekompatybilny z NumPy >= 2.0
+# (rozszerzenia C skompilowane pod NumPy 1.x). Na nowym środowisku import wywala
+# całą aplikację. Poniżej: próba importu, a w razie porażki natywny fallback
+# zgodny z interfejsem używanym w aplikacji (fit / fit_predict / medoid_indices_).
+# ==========================================
+try:
+    from sklearn_extra.cluster import KMedoids
+    ZRODLO_KMEDOIDS = "sklearn_extra"
+except Exception:
+    ZRODLO_KMEDOIDS = "natywna (fallback)"
+
+    class KMedoids:
+        """Lekka natywna implementacja k-medoids (metody 'pam' i 'alternate').
+        Interfejs zgodny z sklearn_extra w zakresie używanym przez aplikację."""
+
+        def __init__(self, n_clusters=8, metric="euclidean", method="alternate",
+                     init="heuristic", max_iter=300, random_state=None):
+            self.n_clusters = n_clusters
+            self.metric = metric
+            self.method = method
+            self.init = init
+            self.max_iter = max_iter
+            self.random_state = random_state
+
+        def _init_medoidy(self, D, rng):
+            n = D.shape[0]
+            if self.init == "heuristic":
+                # punkty najbliżej "środka" – o najmniejszej sumie odległości
+                return list(np.argsort(D.sum(axis=1))[: self.n_clusters])
+            return list(rng.choice(n, self.n_clusters, replace=False))
+
+        @staticmethod
+        def _koszt(D, medoidy):
+            lab = np.argmin(D[:, medoidy], axis=1)
+            n = D.shape[0]
+            return D[np.arange(n), np.array(medoidy)[lab]].sum(), lab
+
+        def fit(self, X):
+            rng = np.random.RandomState(self.random_state)
+            D = pairwise_distances(X, metric=self.metric)
+            n = D.shape[0]
+            medoidy = self._init_medoidy(D, rng)
+            najlepszy_koszt, labels = self._koszt(D, medoidy)
+
+            for _ in range(self.max_iter):
+                zmiana = False
+                if self.method == "pam":
+                    for mi in range(self.n_clusters):
+                        for kandydat in range(n):
+                            if kandydat in medoidy:
+                                continue
+                            nowe = list(medoidy)
+                            nowe[mi] = kandydat
+                            koszt, lab = self._koszt(D, nowe)
+                            if koszt < najlepszy_koszt - 1e-12:
+                                najlepszy_koszt, medoidy, labels = koszt, nowe, lab
+                                zmiana = True
+                else:  # 'alternate' – medoid = punkt minimalizujący sumę odległości w klastrze
+                    labels = np.argmin(D[:, medoidy], axis=1)
+                    nowe = list(medoidy)
+                    for k in range(self.n_clusters):
+                        idx = np.where(labels == k)[0]
+                        if len(idx) == 0:
+                            continue
+                        nowe[k] = idx[np.argmin(D[np.ix_(idx, idx)].sum(axis=1))]
+                    if nowe != medoidy:
+                        medoidy = nowe
+                        zmiana = True
+                    najlepszy_koszt, labels = self._koszt(D, medoidy)
+                if not zmiana:
+                    break
+
+            self.medoid_indices_ = np.array(medoidy)
+            self.labels_ = np.argmin(D[:, medoidy], axis=1)
+            self.inertia_ = najlepszy_koszt
+            return self
+
+        def fit_predict(self, X):
+            return self.fit(X).labels_
+
 
 st.set_page_config(page_title="Klasteryzacja Widm EPR - Ranking Globalny", layout="wide")
 
@@ -28,17 +113,17 @@ def uruchom_clara(X, liczba_grup, random_state=42):
     najlepsze_medoidy = None
     najmniejszy_koszt = float('inf')
     dist_matrix_full = pairwise_distances(X)
-    
-    for _ in range(5): 
+
+    for _ in range(5):
         probka_idx = np.random.choice(n_total, n_samples, replace=False)
         probka_X = X[probka_idx]
         pam = KMedoids(n_clusters=liczba_grup, method='pam', init='heuristic').fit(probka_X)
-        medoidy_w_probce = probka_idx[pam.medoid_indices_] 
+        medoidy_w_probce = probka_idx[pam.medoid_indices_]
         koszt = np.sum(np.min(dist_matrix_full[:, medoidy_w_probce], axis=1))
         if koszt < najmniejszy_koszt:
             najmniejszy_koszt = koszt
             najlepsze_medoidy = medoidy_w_probce
-            
+
     labels = np.argmin(dist_matrix_full[:, najlepsze_medoidy], axis=1)
     return labels
 
@@ -48,33 +133,33 @@ def uruchom_clarans(X, liczba_grup, numlocal=3, maxneighbor=5, random_state=42):
     dist_matrix = pairwise_distances(X)
     najlepsze_medoidy = None
     najmniejszy_koszt = float('inf')
-    
+
     for _ in range(numlocal):
         obecne_medoidy = list(np.random.choice(n_total, liczba_grup, replace=False))
         def oblicz_koszt(medoidy): return np.sum(np.min(dist_matrix[:, medoidy], axis=1))
         obecny_koszt = oblicz_koszt(obecne_medoidy)
-        
+
         j = 0
         while j < maxneighbor:
             m_idx = np.random.randint(liczba_grup)
             stary_medoid = obecne_medoidy[m_idx]
             nowy_medoid = np.random.randint(n_total)
             while nowy_medoid in obecne_medoidy: nowy_medoid = np.random.randint(n_total)
-                
+
             obecne_medoidy[m_idx] = nowy_medoid
             nowy_koszt = oblicz_koszt(obecne_medoidy)
-            
+
             if nowy_koszt < obecny_koszt:
                 obecny_koszt = nowy_koszt
                 j = 0
             else:
                 obecne_medoidy[m_idx] = stary_medoid
                 j += 1
-                
+
         if obecny_koszt < najmniejszy_koszt:
             najmniejszy_koszt = obecny_koszt
             najlepsze_medoidy = list(obecne_medoidy)
-            
+
     labels = np.argmin(dist_matrix[:, najlepsze_medoidy], axis=1)
     return labels
 
@@ -85,8 +170,8 @@ def uruchom_denclue(X, bandwidth=0.5, threshold=0.05):
     kde = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(X)
     dens = np.exp(kde.score_samples(X))
     core_mask = dens > threshold
-    labels = np.full(X.shape[0], -1) 
-    
+    labels = np.full(X.shape[0], -1)
+
     if np.sum(core_mask) > 0:
         dist_matrix = pairwise_distances(X[core_mask])
         adj_matrix = (dist_matrix <= bandwidth).astype(int)
@@ -195,16 +280,16 @@ def uruchom_wavecluster(X, bins=15):
 # ==========================================
 # NATYWNE IMPLEMENTACJE - TABELA 5 (Rozmyte/Fuzzy)
 # ==========================================
-def uruchom_fcm(X, n_clusters, m=2.0, metric='euclidean', max_iter=150, tol=1e-5):
-    np.random.seed(42)
+def uruchom_fcm(X, n_clusters, m=2.0, metric='euclidean', max_iter=150, tol=1e-5, seed=42):
+    np.random.seed(seed)
     n_samples = X.shape[0]
     U = np.random.dirichlet(np.ones(n_clusters), size=n_samples)
-    
+
     for _ in range(max_iter):
         U_m = U ** m
         centers = (U_m.T @ X) / np.fmax(np.sum(U_m, axis=0)[:, None], 1e-10)
         dist = pairwise_distances(X, centers, metric=metric)
-        
+
         U_new = np.zeros_like(U)
         for i in range(n_samples):
             if np.any(dist[i] < 1e-8):
@@ -212,30 +297,30 @@ def uruchom_fcm(X, n_clusters, m=2.0, metric='euclidean', max_iter=150, tol=1e-5
             else:
                 inv_dist = dist[i] ** (-2 / (m - 1))
                 U_new[i] = inv_dist / np.sum(inv_dist)
-                
+
         if np.linalg.norm(U_new - U) < tol:
             break
         U = U_new
-        
+
     return np.argmax(U, axis=1)
 
 def uruchom_mec(X, n_clusters, beta=1.0, max_iter=150):
     np.random.seed(42)
     centers_idx = np.random.choice(X.shape[0], n_clusters, replace=False)
     centers = X[centers_idx]
-    
+
     for _ in range(max_iter):
         dist = pairwise_distances(X, centers, metric='sqeuclidean')
         dist_min = np.min(dist, axis=1, keepdims=True)
         temp = np.exp(-beta * (dist - dist_min))
-        
+
         U = temp / np.fmax(np.sum(temp, axis=1)[:, None], 1e-10)
         new_centers = (U.T @ X) / np.fmax(np.sum(U, axis=0)[:, None], 1e-10)
-        
+
         if np.allclose(centers, new_centers, atol=1e-5):
             break
         centers = new_centers
-        
+
     return np.argmax(U, axis=1)
 
 # ==========================================
@@ -246,37 +331,49 @@ def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_ko
     df = pd.read_excel(plik_excel, sheet_name=0)
     if pomin_kolumne: X_df = df.iloc[:, 1:]
     else: X_df = df
-        
+
     if transponuj:
         X_df = X_df.T
         identyfikatory_widm = X_df.index.astype(str).tolist()
     else:
         if pomin_kolumne: identyfikatory_widm = df.iloc[:, 0].astype(str).tolist()
         else: identyfikatory_widm = [f"Widmo_{i+1}" for i in range(X_df.shape[0])]
-        
+
     X_df = X_df.replace([np.inf, -np.inf], np.nan)
     X_df = X_df.apply(pd.to_numeric, errors='coerce').fillna(0)
-    
+
     X = X_df.values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-        
+
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
-    
+
     ground_truth_labels = None
     df_gt_preview = None
+    ostrzezenie_gt = None
     try:
         df_gt = pd.read_excel(plik_excel, sheet_name='Ground Truth')
         df_gt_preview = df_gt
-        ground_truth_labels = df_gt.iloc[:, gt_indeks_kolumny].values 
-    except Exception: pass 
-    
-    return X, X_scaled, df, ground_truth_labels, df_gt_preview, identyfikatory_widm
+        # Walidacja indeksu kolumny etykiet – wcześniej błąd był cicho połykany,
+        # przez co GT znikało bez informacji dla użytkownika.
+        if gt_indeks_kolumny >= df_gt.shape[1]:
+            ostrzezenie_gt = (
+                f"Arkusz 'Ground Truth' ma {df_gt.shape[1]} kolumn, "
+                f"a wybrany indeks etykiet to {gt_indeks_kolumny}. Etykiety zignorowane."
+            )
+        else:
+            ground_truth_labels = df_gt.iloc[:, gt_indeks_kolumny].values
+    except ValueError:
+        pass  # brak arkusza 'Ground Truth' – to normalna, dozwolona sytuacja
+    except Exception as e:
+        ostrzezenie_gt = f"Nie udało się wczytać 'Ground Truth': {e}"
+
+    return X, X_scaled, df, ground_truth_labels, df_gt_preview, identyfikatory_widm, ostrzezenie_gt
 
 def analizuj_partycjonujace(X_scaled, liczba_grup):
     wyniki = {}
-    wyniki['K-Means'] = KMeans(n_clusters=liczba_grup, random_state=42).fit_predict(X_scaled)
+    wyniki['K-Means'] = KMeans(n_clusters=liczba_grup, random_state=42, n_init=10).fit_predict(X_scaled)
     wyniki['K-Medoids'] = KMedoids(n_clusters=liczba_grup, method='alternate', random_state=42).fit_predict(X_scaled)
     wyniki['PAM'] = KMedoids(n_clusters=liczba_grup, method='pam', random_state=42).fit_predict(X_scaled)
     wyniki['CLARA'] = uruchom_clara(X_scaled, liczba_grup)
@@ -304,9 +401,13 @@ def analizuj_siatkowe(X_scaled, bins):
 
 def analizuj_rozmyte(X_scaled, liczba_grup, m_fuzziness, beta_mec):
     wyniki = {}
-    wyniki['Fuzzy k-means'] = uruchom_fcm(X_scaled, liczba_grup, m=m_fuzziness, metric='euclidean')
-    wyniki['Fuzzy k-modes'] = uruchom_fcm(X_scaled, liczba_grup, m=m_fuzziness, metric='manhattan')
-    wyniki['FCM'] = uruchom_fcm(X_scaled, liczba_grup, m=m_fuzziness, metric='euclidean')
+    # UWAGA metodologiczna: FCM (Fuzzy C-Means) to ten sam algorytm co "Fuzzy k-means".
+    # W oryginale oba liczono IDENTYCZNIE (euclidean, ten sam seed) -> dwa takie same
+    # wiersze w rankingu. Aby wiersze nie były bit-w-bit identyczne (co myli ewaluację),
+    # FCM inicjalizowany jest innym ziarnem. Jeśli chcesz je scalić - usuń jeden wpis.
+    wyniki['Fuzzy k-means'] = uruchom_fcm(X_scaled, liczba_grup, m=m_fuzziness, metric='euclidean', seed=42)
+    wyniki['Fuzzy k-modes'] = uruchom_fcm(X_scaled, liczba_grup, m=m_fuzziness, metric='manhattan', seed=42)
+    wyniki['FCM'] = uruchom_fcm(X_scaled, liczba_grup, m=m_fuzziness, metric='euclidean', seed=7)
     gmm_fcs = GaussianMixture(n_components=liczba_grup, covariance_type='spherical', random_state=42, reg_covar=1e-4)
     wyniki['FCS'] = gmm_fcs.fit_predict(X_scaled)
     gmm_mm = GaussianMixture(n_components=liczba_grup, covariance_type='diag', random_state=42, reg_covar=1e-4)
@@ -314,19 +415,19 @@ def analizuj_rozmyte(X_scaled, liczba_grup, m_fuzziness, beta_mec):
     wyniki['MEC'] = uruchom_mec(X_scaled, liczba_grup, beta=beta_mec)
     return wyniki
 
-def generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_y=None):
+def generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_y=0.0):
     fig, ax = plt.subplots(figsize=(10, 5))
     unikalne_etykiety = np.unique(etykiety)
     os_x = np.arange(X.shape[1])
-    
+
     for etykieta in unikalne_etykiety:
         maska = (etykiety == etykieta)
         liczba_widm = np.sum(maska)
         if liczba_widm == 0: continue
-            
+
         srednie_widmo = np.mean(X[maska], axis=0)
         odchylenie = np.std(X[maska], axis=0)
-        
+
         if etykieta == -1:
             line = ax.plot(os_x, srednie_widmo, color='gray', linestyle='--', label=f'Szum (-1) [n={liczba_widm}]')
             ax.fill_between(os_x, srednie_widmo - odchylenie, srednie_widmo + odchylenie, color='gray', alpha=0.2)
@@ -334,15 +435,16 @@ def generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_y=None):
             line = ax.plot(os_x, srednie_widmo, label=f'Klaster {etykieta} [n={liczba_widm}]')
             kolor = line[0].get_color()
             ax.fill_between(os_x, srednie_widmo - odchylenie, srednie_widmo + odchylenie, color=kolor, alpha=0.2)
-            
+
     ax.set_title(f'Średnia reprezentacja klastrów: {nazwa_algorytmu}')
     ax.set_xlabel('Punkt pomiarowy')
     ax.set_ylabel('Średnie natężenie')
-    if limit_y > 0.0:
+    # Zabezpieczenie: limit_y może być None -> unikamy TypeError przy porównaniu.
+    if limit_y is not None and limit_y > 0.0:
         min_y = np.min(X)
         dolna_granica = min_y - (0.05 * abs(min_y)) if min_y < 0 else -0.05
         ax.set_ylim(bottom=dolna_granica, top=limit_y)
-        
+
     ax.legend()
     ax.grid(True, linestyle=':', alpha=0.7)
     plt.tight_layout()
@@ -350,15 +452,16 @@ def generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_y=None):
 
 # --- INTERFEJS STREAMLIT ---
 st.title("🔬 Analiza i Klasteryzacja Widm EPR")
+st.caption(f"Źródło implementacji K-Medoids/PAM/CLARA: **{ZRODLO_KMEDOIDS}**")
 
 st.sidebar.header("Wybór Metodologii")
 rodzina_algorytmow = st.sidebar.radio(
     "Którą procedurę chcesz uruchomić?",
     (
-        "Partycjonujące (Tab 2)", 
-        "Oparte na Gęstości (Tab 3)", 
-        "Oparte na Siatce (Tab 4)", 
-        "Rozmyte / Fuzzy (Tab 5)", 
+        "Partycjonujące (Tab 2)",
+        "Oparte na Gęstości (Tab 3)",
+        "Oparte na Siatce (Tab 4)",
+        "Rozmyte / Fuzzy (Tab 5)",
         "🔥 WSZYSTKIE NA RAZ (Globalny Ranking)"
     )
 )
@@ -394,15 +497,15 @@ elif rodzina_algorytmow == "Rozmyte / Fuzzy (Tab 5)":
 elif rodzina_algorytmow == "🔥 WSZYSTKIE NA RAZ (Globalny Ranking)":
     st.sidebar.markdown("**Zestawienie Globalne (Dostęp do wszystkich parametrów)**")
     liczba_grup = st.sidebar.number_input("Liczba klastrów (K) dla Metod Partycjonujących i Rozmytych:", min_value=2, max_value=20, value=5)
-    
+
     with st.sidebar.expander("Parametry Metod Gęstościowych"):
         eps_val = st.slider("Promień poszukiwań (eps):", 0.1, 20.0, 5.0, 0.1)
         min_samples_val = st.number_input("Minimalna liczba punktów:", 2, 50, 3)
         bandwidth_val = st.slider("Szerokość pasma (bandwidth):", 0.1, 20.0, 2.0, 0.1)
-        
+
     with st.sidebar.expander("Parametry Metod Siatkowych"):
         bins_val = st.slider("Rozdzielczość siatki (komórki):", 5, 50, 15)
-        
+
     with st.sidebar.expander("Parametry Metod Rozmytych (poza K)"):
         m_fuzziness = st.slider("Współczynnik rozmycia (m) dla FCM:", 1.1, 5.0, 2.0, 0.1)
         beta_mec = st.slider("Parametr temperatury (\u03B2) dla MEC:", 0.1, 10.0, 1.0, 0.1)
@@ -422,14 +525,22 @@ wgrany_plik = st.file_uploader("Wybierz plik Excel (.xlsx)", type=['xlsx'])
 if wgrany_plik is not None:
     try:
         with st.spinner('Wczytywanie i przygotowywanie danych...'):
-            X, X_scaled, oryginalny_df, gt_labels, df_gt_preview, identyfikatory = wczytaj_i_przygotuj_dane(
+            X, X_scaled, oryginalny_df, gt_labels, df_gt_preview, identyfikatory, ostrzezenie_gt = wczytaj_i_przygotuj_dane(
                 wgrany_plik, pomin_kolumne, transpozycja, gt_indeks
             )
-            
+
         st.success(f"Dane wczytano! Główne dane: {X.shape[0]} widm, {X.shape[1]} punktów pomiarowych.")
-        
+
+        if ostrzezenie_gt:
+            st.warning(f"⚠️ {ostrzezenie_gt}")
+
         if gt_labels is not None:
             st.info("✅ Wykryto arkusz 'Ground Truth'.")
+            if len(gt_labels) != X.shape[0]:
+                st.warning(
+                    f"⚠️ Liczba etykiet GT ({len(gt_labels)}) nie zgadza się z liczbą widm ({X.shape[0]}). "
+                    "Upewnij się też, że KOLEJNOŚĆ etykiet odpowiada kolejności widm w danych."
+                )
             with st.expander("Kliknij, aby rozwinąć PODGLĄD GROUND TRUTH"):
                 col1, col2 = st.columns(2)
                 with col1:
@@ -437,13 +548,13 @@ if wgrany_plik is not None:
                 with col2:
                     st.write(gt_labels[:10])
                     st.markdown(f"*Liczba unikalnych etykiet: {len(np.unique(gt_labels))}*")
-        
+
         if st.button("Uruchom Klasteryzację", type="primary"):
             if gt_labels is not None and len(gt_labels) != X.shape[0]:
                 st.error(f"❌ Błąd zgodności! Ground Truth (ilość: {len(gt_labels)}) nie pasuje do badanych widm ({X.shape[0]}).")
             else:
                 with st.spinner('Trwa obliczanie klastrów... W trybie globalnym może to zająć chwilę.'):
-                    
+
                     wyniki = {}
                     if rodzina_algorytmow == "Partycjonujące (Tab 2)":
                         wyniki.update(analizuj_partycjonujace(X_scaled, liczba_grup))
@@ -458,12 +569,13 @@ if wgrany_plik is not None:
                         wyniki.update(analizuj_gestosciowe(X_scaled, eps_val, min_samples_val, bandwidth_val))
                         wyniki.update(analizuj_siatkowe(X_scaled, bins_val))
                         wyniki.update(analizuj_rozmyte(X_scaled, liczba_grup, m_fuzziness, beta_mec))
-                        
+
                     wykresy = {}
                     wyniki_ewaluacji = []
-                    
+                    df_ewaluacja = None
+
                     st.subheader("Skład poszczególnych klastrów")
-                    
+
                     for nazwa_algorytmu, etykiety in wyniki.items():
                         with st.expander(f"Rozkład widm: {nazwa_algorytmu}"):
                             unikalne = np.unique(etykiety)
@@ -472,43 +584,47 @@ if wgrany_plik is not None:
                                 id_widm_w_klastrze = [identyfikatory[i] for i in indeksy_w_klastrze]
                                 nazwa_kat = f"Klaster {etyk}" if etyk != -1 else "Szum (-1)"
                                 st.markdown(f"**{nazwa_kat}** (Sztuk: {len(indeksy_w_klastrze)}): {', '.join(id_widm_w_klastrze)}")
-                        
+
                         fig = generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_osi_y)
                         wykresy[nazwa_algorytmu] = fig
-                        
+
                         if gt_labels is not None:
                             ari_score = adjusted_rand_score(gt_labels, etykiety)
                             wyniki_ewaluacji.append({
                                 "Algorytm": nazwa_algorytmu,
                                 "ARI (Adjusted Rand Index)": round(ari_score, 4)
                             })
-                    
-                    if gt_labels is not None:
+
+                    if gt_labels is not None and wyniki_ewaluacji:
                         st.subheader("Wyniki Ewaluacji (Ranking Globalny)")
                         df_ewaluacja = pd.DataFrame(wyniki_ewaluacji).sort_values(by="ARI (Adjusted Rand Index)", ascending=False)
-                        # Opcja wizualnego formatowania dla ułatwienia czytania wielkiej tabeli
-                        st.dataframe(df_ewaluacja.style.highlight_max(subset=['ARI (Adjusted Rand Index)'], color='lightgreen'), use_container_width=True)
-    
+                        st.dataframe(
+                            df_ewaluacja.style.highlight_max(subset=['ARI (Adjusted Rand Index)'], color='lightgreen'),
+                            use_container_width=True
+                        )
+
                     st.subheader("Wizualizacja średnich widm z pasmem błędu")
-                    # Rysowanie wszystkich wykresów, podzielone na 2 kolumny, by UI było czytelniejsze
                     cols = st.columns(2)
                     for i, (nazwa, fig) in enumerate(wykresy.items()):
                         with cols[i % 2]:
                             st.pyplot(fig)
-                        plt.close(fig) # Czyszczenie pamięci po narysowaniu, przydatne przy 22 wykresach!
-                
+                        # NIE zamykamy figur tutaj – są jeszcze potrzebne do eksportu Excel poniżej.
+
+                # --- EKSPORT DO EXCELA ---
                 bufor = io.BytesIO()
                 with pd.ExcelWriter(bufor, engine='xlsxwriter') as writer:
                     wyniki_df = pd.DataFrame(X)
-                    if transpozycja: wyniki_df.index = identyfikatory
-                    
+                    # Spójne indeksowanie: zawsze przypisujemy identyfikatory widm jako indeks.
+                    wyniki_df.index = identyfikatory
+
                     for algorytm, etyk in wyniki.items():
                         wyniki_df[f'Klaster_{algorytm}'] = etyk
-                    
+
                     wyniki_df.to_excel(writer, sheet_name='Sklasyfikowane_Dane')
-                    if gt_labels is not None: df_ewaluacja.to_excel(writer, sheet_name='Ewaluacja', index=False)
-                    
-                    workbook  = writer.book
+                    if df_ewaluacja is not None:
+                        df_ewaluacja.to_excel(writer, sheet_name='Ewaluacja', index=False)
+
+                    workbook = writer.book
                     worksheet = workbook.add_worksheet('Wykresy_Klastrow')
                     wiersz_start = 1
                     for nazwa, fig in wykresy.items():
@@ -517,13 +633,20 @@ if wgrany_plik is not None:
                         img_data.seek(0)
                         worksheet.insert_image(f'B{wiersz_start}', nazwa, {'image_data': img_data})
                         wiersz_start += 28
-    
+
+                # Dopiero teraz zwalniamy pamięć – po wykorzystaniu figur w eksporcie.
+                for fig in wykresy.values():
+                    plt.close(fig)
+
                 st.download_button(
                     label="⬇️ Pobierz plik Excel (Kompletny Raport)",
                     data=bufor.getvalue(),
                     file_name="sklasyfikowane_widma_globalne.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
-            
+
     except Exception as e:
         st.error(f"Wystąpił błąd podczas przetwarzania pliku: {e}")
+        # Pełny traceback dla łatwiejszej diagnozy (wcześniej był ukrywany).
+        st.exception(e)
+        st.code(traceback.format_exc())
