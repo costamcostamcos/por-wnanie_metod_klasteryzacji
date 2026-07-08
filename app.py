@@ -16,7 +16,7 @@ import scipy.sparse as sp
 from scipy.sparse.csgraph import connected_components
 from scipy.ndimage import gaussian_filter, maximum_filter
 
-st.set_page_config(page_title="Klasteryzacja Widm EPR", layout="wide")
+st.set_page_config(page_title="Klasteryzacja Widm EPR - Ranking Globalny", layout="wide")
 
 # ==========================================
 # NATYWNE IMPLEMENTACJE - TABELA 2 (Partycjonujące)
@@ -254,19 +254,14 @@ def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_ko
         if pomin_kolumne: identyfikatory_widm = df.iloc[:, 0].astype(str).tolist()
         else: identyfikatory_widm = [f"Widmo_{i+1}" for i in range(X_df.shape[0])]
         
-    # Zamiana nieskończoności na NaN, a następnie ustandaryzowanie do 0
     X_df = X_df.replace([np.inf, -np.inf], np.nan)
     X_df = X_df.apply(pd.to_numeric, errors='coerce').fillna(0)
     
     X = X_df.values
-    
-    # 100% pewności, że X jest bezpieczną macierzą liczb (bez NaN)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-    
-    # Kolejne zabezpieczenie po skalowaniu (np. przypadek wariancji równej 0)
     X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
     
     ground_truth_labels = None
@@ -312,13 +307,10 @@ def analizuj_rozmyte(X_scaled, liczba_grup, m_fuzziness, beta_mec):
     wyniki['Fuzzy k-means'] = uruchom_fcm(X_scaled, liczba_grup, m=m_fuzziness, metric='euclidean')
     wyniki['Fuzzy k-modes'] = uruchom_fcm(X_scaled, liczba_grup, m=m_fuzziness, metric='manhattan')
     wyniki['FCM'] = uruchom_fcm(X_scaled, liczba_grup, m=m_fuzziness, metric='euclidean')
-    
     gmm_fcs = GaussianMixture(n_components=liczba_grup, covariance_type='spherical', random_state=42, reg_covar=1e-4)
     wyniki['FCS'] = gmm_fcs.fit_predict(X_scaled)
-    
     gmm_mm = GaussianMixture(n_components=liczba_grup, covariance_type='diag', random_state=42, reg_covar=1e-4)
     wyniki['MM'] = gmm_mm.fit_predict(X_scaled)
-    
     wyniki['MEC'] = uruchom_mec(X_scaled, liczba_grup, beta=beta_mec)
     return wyniki
 
@@ -361,12 +353,24 @@ st.title("🔬 Analiza i Klasteryzacja Widm EPR")
 
 st.sidebar.header("Wybór Metodologii")
 rodzina_algorytmow = st.sidebar.radio(
-    "Którą rodzinę algorytmów chcesz uruchomić?",
-    ("Partycjonujące (Tab 2)", "Oparte na Gęstości (Tab 3)", "Oparte na Siatce (Tab 4)", "Rozmyte / Fuzzy (Tab 5)")
+    "Którą procedurę chcesz uruchomić?",
+    (
+        "Partycjonujące (Tab 2)", 
+        "Oparte na Gęstości (Tab 3)", 
+        "Oparte na Siatce (Tab 4)", 
+        "Rozmyte / Fuzzy (Tab 5)", 
+        "🔥 WSZYSTKIE NA RAZ (Globalny Ranking)"
+    )
 )
 
 st.sidebar.markdown("---")
 st.sidebar.header("Parametry algorytmów")
+
+# Zmienne domyślne dla bezpieczeństwa
+liczba_grup = 5
+eps_val, min_samples_val, bandwidth_val = 5.0, 3, 2.0
+bins_val = 15
+m_fuzziness, beta_mec = 2.0, 1.0
 
 if rodzina_algorytmow == "Partycjonujące (Tab 2)":
     liczba_grup = st.sidebar.number_input("Liczba klastrów (K):", min_value=2, max_value=20, value=3)
@@ -386,6 +390,22 @@ elif rodzina_algorytmow == "Rozmyte / Fuzzy (Tab 5)":
     liczba_grup = st.sidebar.number_input("Liczba klastrów (K):", min_value=2, max_value=20, value=3)
     m_fuzziness = st.sidebar.slider("Współczynnik rozmycia (m) dla FCM:", min_value=1.1, max_value=5.0, value=2.0, step=0.1)
     beta_mec = st.sidebar.slider("Parametr temperatury (\u03B2) dla MEC:", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
+
+elif rodzina_algorytmow == "🔥 WSZYSTKIE NA RAZ (Globalny Ranking)":
+    st.sidebar.markdown("**Zestawienie Globalne (Dostęp do wszystkich parametrów)**")
+    liczba_grup = st.sidebar.number_input("Liczba klastrów (K) dla Metod Partycjonujących i Rozmytych:", min_value=2, max_value=20, value=5)
+    
+    with st.sidebar.expander("Parametry Metod Gęstościowych"):
+        eps_val = st.slider("Promień poszukiwań (eps):", 0.1, 20.0, 5.0, 0.1)
+        min_samples_val = st.number_input("Minimalna liczba punktów:", 2, 50, 3)
+        bandwidth_val = st.slider("Szerokość pasma (bandwidth):", 0.1, 20.0, 2.0, 0.1)
+        
+    with st.sidebar.expander("Parametry Metod Siatkowych"):
+        bins_val = st.slider("Rozdzielczość siatki (komórki):", 5, 50, 15)
+        
+    with st.sidebar.expander("Parametry Metod Rozmytych (poza K)"):
+        m_fuzziness = st.slider("Współczynnik rozmycia (m) dla FCM:", 1.1, 5.0, 2.0, 0.1)
+        beta_mec = st.slider("Parametr temperatury (\u03B2) dla MEC:", 0.1, 10.0, 1.0, 0.1)
 
 st.sidebar.markdown("---")
 st.sidebar.header("Ustawienia danych")
@@ -422,16 +442,22 @@ if wgrany_plik is not None:
             if gt_labels is not None and len(gt_labels) != X.shape[0]:
                 st.error(f"❌ Błąd zgodności! Ground Truth (ilość: {len(gt_labels)}) nie pasuje do badanych widm ({X.shape[0]}).")
             else:
-                with st.spinner('Trwa obliczanie klastrów...'):
+                with st.spinner('Trwa obliczanie klastrów... W trybie globalnym może to zająć chwilę.'):
                     
+                    wyniki = {}
                     if rodzina_algorytmow == "Partycjonujące (Tab 2)":
-                        wyniki = analizuj_partycjonujace(X_scaled, liczba_grup)
+                        wyniki.update(analizuj_partycjonujace(X_scaled, liczba_grup))
                     elif rodzina_algorytmow == "Oparte na Gęstości (Tab 3)":
-                        wyniki = analizuj_gestosciowe(X_scaled, eps_val, min_samples_val, bandwidth_val)
+                        wyniki.update(analizuj_gestosciowe(X_scaled, eps_val, min_samples_val, bandwidth_val))
                     elif rodzina_algorytmow == "Oparte na Siatce (Tab 4)":
-                        wyniki = analizuj_siatkowe(X_scaled, bins_val)
+                        wyniki.update(analizuj_siatkowe(X_scaled, bins_val))
                     elif rodzina_algorytmow == "Rozmyte / Fuzzy (Tab 5)":
-                        wyniki = analizuj_rozmyte(X_scaled, liczba_grup, m_fuzziness, beta_mec)
+                        wyniki.update(analizuj_rozmyte(X_scaled, liczba_grup, m_fuzziness, beta_mec))
+                    elif rodzina_algorytmow == "🔥 WSZYSTKIE NA RAZ (Globalny Ranking)":
+                        wyniki.update(analizuj_partycjonujace(X_scaled, liczba_grup))
+                        wyniki.update(analizuj_gestosciowe(X_scaled, eps_val, min_samples_val, bandwidth_val))
+                        wyniki.update(analizuj_siatkowe(X_scaled, bins_val))
+                        wyniki.update(analizuj_rozmyte(X_scaled, liczba_grup, m_fuzziness, beta_mec))
                         
                     wykresy = {}
                     wyniki_ewaluacji = []
@@ -458,13 +484,18 @@ if wgrany_plik is not None:
                             })
                     
                     if gt_labels is not None:
-                        st.subheader("Wyniki Ewaluacji (porównanie z Ground Truth)")
+                        st.subheader("Wyniki Ewaluacji (Ranking Globalny)")
                         df_ewaluacja = pd.DataFrame(wyniki_ewaluacji).sort_values(by="ARI (Adjusted Rand Index)", ascending=False)
-                        st.dataframe(df_ewaluacja, use_container_width=True)
+                        # Opcja wizualnego formatowania dla ułatwienia czytania wielkiej tabeli
+                        st.dataframe(df_ewaluacja.style.highlight_max(subset=['ARI (Adjusted Rand Index)'], color='lightgreen'), use_container_width=True)
     
                     st.subheader("Wizualizacja średnich widm z pasmem błędu")
-                    for nazwa, fig in wykresy.items():
-                        st.pyplot(fig)
+                    # Rysowanie wszystkich wykresów, podzielone na 2 kolumny, by UI było czytelniejsze
+                    cols = st.columns(2)
+                    for i, (nazwa, fig) in enumerate(wykresy.items()):
+                        with cols[i % 2]:
+                            st.pyplot(fig)
+                        plt.close(fig) # Czyszczenie pamięci po narysowaniu, przydatne przy 22 wykresach!
                 
                 bufor = io.BytesIO()
                 with pd.ExcelWriter(bufor, engine='xlsxwriter') as writer:
@@ -488,9 +519,9 @@ if wgrany_plik is not None:
                         wiersz_start += 28
     
                 st.download_button(
-                    label="⬇️ Pobierz plik Excel (Wyniki)",
+                    label="⬇️ Pobierz plik Excel (Kompletny Raport)",
                     data=bufor.getvalue(),
-                    file_name="sklasyfikowane_widma.xlsx",
+                    file_name="sklasyfikowane_widma_globalne.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             
