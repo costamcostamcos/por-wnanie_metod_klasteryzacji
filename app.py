@@ -11,7 +11,6 @@ from sklearn.metrics import adjusted_rand_score
 st.set_page_config(page_title="Klasteryzacja Widm EPR", layout="wide")
 
 def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_kolumny):
-    # Wczytanie głównego arkusza
     df = pd.read_excel(plik_excel, sheet_name=0)
     
     if pomin_kolumne:
@@ -21,6 +20,14 @@ def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_ko
         
     if transponuj:
         X_df = X_df.T
+        # Po transpozycji indeksy (dawne nagłówki kolumn) stają się nazwami widm
+        identyfikatory_widm = X_df.index.astype(str).tolist()
+    else:
+        # Jeśli nie ma transpozycji, ale usunęliśmy 1. kolumnę, uznajemy ją za ID próbek
+        if pomin_kolumne:
+            identyfikatory_widm = df.iloc[:, 0].astype(str).tolist()
+        else:
+            identyfikatory_widm = [f"Widmo_{i+1}" for i in range(X_df.shape[0])]
         
     X_df = X_df.apply(pd.to_numeric, errors='coerce').fillna(0)
     X = X_df.values
@@ -28,18 +35,16 @@ def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_ko
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    # Wczytanie Ground Truth
     ground_truth_labels = None
     df_gt_preview = None
     try:
         df_gt = pd.read_excel(plik_excel, sheet_name='Ground Truth')
         df_gt_preview = df_gt
-        # Wczytujemy kolumnę wybraną przez użytkownika (domyślnie 0 - pierwsza)
         ground_truth_labels = df_gt.iloc[:, gt_indeks_kolumny].values 
     except Exception:
         pass 
     
-    return X, X_scaled, df, ground_truth_labels, df_gt_preview
+    return X, X_scaled, df, ground_truth_labels, df_gt_preview, identyfikatory_widm
 
 def analizuj_widma_epr(X_scaled, liczba_grup, eps_dbscan, min_samples_dbscan):
     wyniki_klasteryzacji = {}
@@ -70,20 +75,27 @@ def analizuj_widma_epr(X_scaled, liczba_grup, eps_dbscan, min_samples_dbscan):
 def generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_y=None):
     fig, ax = plt.subplots(figsize=(10, 5))
     unikalne_etykiety = np.unique(etykiety)
+    os_x = np.arange(X.shape[1])
     
     for etykieta in unikalne_etykiety:
         maska = (etykiety == etykieta)
-        if not np.any(maska):
+        liczba_widm = np.sum(maska)
+        if liczba_widm == 0:
             continue
             
         srednie_widmo = np.mean(X[maska], axis=0)
+        odchylenie = np.std(X[maska], axis=0) # Obliczanie błędu (odchylenia standardowego)
         
         if etykieta == -1:
-            ax.plot(srednie_widmo, color='gray', linestyle='--', alpha=0.6, label='Szum (-1)')
+            line = ax.plot(os_x, srednie_widmo, color='gray', linestyle='--', label=f'Szum (-1) [n={liczba_widm}]')
+            ax.fill_between(os_x, srednie_widmo - odchylenie, srednie_widmo + odchylenie, color='gray', alpha=0.2)
         else:
-            ax.plot(srednie_widmo, label=f'Klaster {etykieta}')
+            line = ax.plot(os_x, srednie_widmo, label=f'Klaster {etykieta} [n={liczba_widm}]')
+            kolor = line[0].get_color()
+            # Rysowanie wstęgi błędu wokół średniej
+            ax.fill_between(os_x, srednie_widmo - odchylenie, srednie_widmo + odchylenie, color=kolor, alpha=0.2)
             
-    ax.set_title(f'Średnia reprezentacja klastrów: {nazwa_algorytmu}')
+    ax.set_title(f'Średnia reprezentacja klastrów: {nazwa_algorytmu} (wstęga = $\pm$1 odchylenie std)')
     ax.set_xlabel('Punkt pomiarowy')
     ax.set_ylabel('Średnie natężenie')
     
@@ -121,14 +133,14 @@ wgrany_plik = st.file_uploader("Wybierz plik Excel (.xlsx)", type=['xlsx'])
 if wgrany_plik is not None:
     try:
         with st.spinner('Wczytywanie i skalowanie danych...'):
-            X, X_scaled, oryginalny_df, gt_labels, df_gt_preview = wczytaj_i_przygotuj_dane(
+            X, X_scaled, oryginalny_df, gt_labels, df_gt_preview, identyfikatory = wczytaj_i_przygotuj_dane(
                 wgrany_plik, pomin_kolumne, transpozycja, gt_indeks
             )
             
         st.success(f"Dane wczytano! Główne dane: {X.shape[0]} widm, {X.shape[1]} punktów.")
         
         if gt_labels is not None:
-            st.info(f"✅ Wykryto arkusz 'Ground Truth'.")
+            st.info("✅ Wykryto arkusz 'Ground Truth'.")
             with st.expander("Kliknij, aby rozwinąć PODGLĄD GROUND TRUTH (Sprawdź, czy etykiety są poprawne!)"):
                 col1, col2 = st.columns(2)
                 with col1:
@@ -139,9 +151,7 @@ if wgrany_plik is not None:
                     st.write(gt_labels[:10])
                     st.markdown(f"*Liczba unikalnych etykiet: {len(np.unique(gt_labels))}*")
                     if len(np.unique(gt_labels)) > 20:
-                        st.error("⚠️ UWAGA! Wykryto bardzo dużo unikalnych etykiet. Prawdopodobnie wczytałeś kolumnę z nazwami próbek zamiast z numerami klastrów. Zmień indeks kolumny w panelu bocznym!")
-        else:
-            st.warning("⚠️ Brak arkusza 'Ground Truth'. Ewaluacja pominęta.")
+                        st.error("⚠️ UWAGA! Wykryto bardzo dużo unikalnych etykiet. Zmień indeks kolumny w panelu bocznym!")
         
         if st.button("Uruchom Klasteryzację", type="primary"):
             if gt_labels is not None and len(gt_labels) != X.shape[0]:
@@ -152,8 +162,17 @@ if wgrany_plik is not None:
                     wykresy = {}
                     wyniki_ewaluacji = []
                     
+                    st.subheader("Skład poszczególnych klastrów (które widma trafiły gdzie)")
+                    
                     for nazwa_algorytmu, etykiety in wyniki.items():
-                        oryginalny_df[f'Klaster_{nazwa_algorytmu}'] = "Zapis w nowym arkuszu"
+                        # Generowanie tekstu z przypisaniami widm do interfejsu
+                        with st.expander(f"Rozkład widm: {nazwa_algorytmu}"):
+                            unikalne = np.unique(etykiety)
+                            for etyk in unikalne:
+                                indeksy_w_klastrze = np.where(etykiety == etyk)[0]
+                                id_widm_w_klastrze = [identyfikatory[i] for i in indeksy_w_klastrze]
+                                nazwa_kategorii = f"Klaster {etyk}" if etyk != -1 else "Szum (-1)"
+                                st.markdown(f"**{nazwa_kategorii}** (Sztuk: {len(indeksy_w_klastrze)}): {', '.join(id_widm_w_klastrze)}")
                         
                         fig = generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_osi_y)
                         wykresy[nazwa_algorytmu] = fig
@@ -170,17 +189,21 @@ if wgrany_plik is not None:
                         df_ewaluacja = pd.DataFrame(wyniki_ewaluacji).sort_values(by="ARI (Adjusted Rand Index)", ascending=False)
                         st.dataframe(df_ewaluacja, use_container_width=True)
     
-                    st.subheader("Wizualizacja średnich widm w klastrach")
+                    st.subheader("Wizualizacja średnich widm z pasmem błędu")
                     for nazwa, fig in wykresy.items():
                         st.pyplot(fig)
                 
                 bufor = io.BytesIO()
                 with pd.ExcelWriter(bufor, engine='xlsxwriter') as writer:
                     wyniki_df = pd.DataFrame(X)
+                    # Odtwarzamy oryginalne nazwy kolumn jeśli była transpozycja
+                    if transpozycja:
+                        wyniki_df.index = identyfikatory
+                    
                     for algorytm, etyk in wyniki.items():
                         wyniki_df[f'Klaster_{algorytm}'] = etyk
                     
-                    wyniki_df.to_excel(writer, sheet_name='Sklasyfikowane_Dane', index=False)
+                    wyniki_df.to_excel(writer, sheet_name='Sklasyfikowane_Dane')
                     
                     if gt_labels is not None:
                         df_ewaluacja.to_excel(writer, sheet_name='Ewaluacja', index=False)
