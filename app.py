@@ -647,6 +647,7 @@ def analizuj_hierarchiczne(X_scaled, liczba_grup, birch_threshold=0.5, cure_repr
     wyniki = {}
     wyniki['SLINK'] = AgglomerativeClustering(n_clusters=liczba_grup, linkage='single').fit_predict(X_scaled)
     wyniki['CLINK'] = AgglomerativeClustering(n_clusters=liczba_grup, linkage='complete').fit_predict(X_scaled)
+    wyniki['Ward'] = AgglomerativeClustering(n_clusters=liczba_grup, linkage='ward').fit_predict(X_scaled)
     wyniki['BIRCH'] = Birch(n_clusters=liczba_grup, threshold=birch_threshold).fit_predict(X_scaled)
     wyniki['CURE'] = uruchom_cure(X_scaled, liczba_grup, n_repr=cure_repr, shrink=cure_shrink)
     wyniki['ROCK'] = uruchom_rock(X_scaled, liczba_grup, theta=rock_theta)
