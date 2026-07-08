@@ -835,7 +835,8 @@ else:
 
 st.sidebar.markdown("---")
 st.sidebar.header("Ground Truth")
-gt_indeks = st.sidebar.number_input("Indeks kolumny etykiet (0 = pierwsza):", min_value=0, max_value=10, value=0)
+st.sidebar.caption("Etykiety odczytywane zawsze z kolumny o indeksie 1 arkusza 'Ground Truth'.")
+gt_indeks = 1
 
 wgrany_plik = st.file_uploader("Wybierz plik Excel (.xlsx)", type=['xlsx'])
 
@@ -880,13 +881,6 @@ if wgrany_plik is not None:
                     f"⚠️ Liczba etykiet GT ({len(gt_labels)}) nie zgadza się z liczbą widm ({X.shape[0]}). "
                     "Upewnij się też, że KOLEJNOŚĆ etykiet odpowiada kolejności widm w danych."
                 )
-            with st.expander("Kliknij, aby rozwinąć PODGLĄD GROUND TRUTH"):
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.dataframe(df_gt_preview.head(10))
-                with col2:
-                    st.write(gt_labels[:10])
-                    st.markdown(f"*Liczba unikalnych etykiet: {len(np.unique(gt_labels))}*")
 
         if st.button("Uruchom Klasteryzację", type="primary"):
             if gt_labels is not None and len(gt_labels) != X.shape[0]:
