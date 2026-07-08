@@ -1,4 +1,20 @@
+import subprocess
+import sys
 import streamlit as st
+
+# --- BRUTALNE WYMUSZENIE INSTALACJI PYCLUSTERING ---
+@st.cache_resource
+def zainstaluj_braki():
+    try:
+        import pyclustering
+    except ImportError:
+        print("Instalowanie pyclustering w locie...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "pyclustering"])
+
+# Uruchomienie funkcji zanim skrypt przejdzie do właściwych importów
+zainstaluj_braki()
+# ---------------------------------------------------
+
 import pandas as pd
 import numpy as np
 import io
@@ -7,6 +23,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn_extra.cluster import KMedoids
 from sklearn.metrics import adjusted_rand_score
+
+# Zwykłe importy pyclustering po upewnieniu się, że biblioteka istnieje
 from pyclustering.cluster.clara import clara
 from pyclustering.cluster.clarans import clarans
 
@@ -22,6 +40,7 @@ def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_ko
         
     if transponuj:
         X_df = X_df.T
+        # Po transpozycji indeksy (dawne nagłówki kolumn) stają się nazwami widm
         identyfikatory_widm = X_df.index.astype(str).tolist()
     else:
         if pomin_kolumne:
@@ -29,6 +48,7 @@ def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_ko
         else:
             identyfikatory_widm = [f"Widmo_{i+1}" for i in range(X_df.shape[0])]
         
+    # Czyszczenie błędów typu '#REF!'
     X_df = X_df.apply(pd.to_numeric, errors='coerce').fillna(0)
     X = X_df.values
         
@@ -53,7 +73,7 @@ def analizuj_widma_epr(X_scaled, liczba_grup):
     kmeans = KMeans(n_clusters=liczba_grup, random_state=42)
     wyniki_klasteryzacji['K-Means'] = kmeans.fit_predict(X_scaled)
     
-    # 2. K-Medoids (standardowa metoda alternatywna wg implementacji sklearn_extra)
+    # 2. K-Medoids (Alternatywna implementacja PAM)
     kmedoids = KMedoids(n_clusters=liczba_grup, method='alternate', random_state=42)
     wyniki_klasteryzacji['K-Medoids'] = kmedoids.fit_predict(X_scaled)
 
@@ -65,13 +85,11 @@ def analizuj_widma_epr(X_scaled, liczba_grup):
     dane_pyclustering = X_scaled.tolist()
     
     # 4. CLARA
-    # Parametr 'number_samples' określa rozmiar podpróbki. Zazwyczaj 40 + 2*k jest dobrym punktem wyjścia.
     rozmiar_probki_clara = min(len(dane_pyclustering), 40 + 2 * liczba_grup)
     clara_instance = clara(dane_pyclustering, liczba_grup, rozmiar_probki_clara)
     clara_instance.process()
     clara_clusters = clara_instance.get_clusters()
     
-    # Konwersja formatu pyclustering na płaską tablicę etykiet (taką jak ze sklearn)
     etykiety_clara = np.zeros(X_scaled.shape[0], dtype=int)
     for id_klastra, klaster in enumerate(clara_clusters):
         for id_punktu in klaster:
@@ -79,7 +97,6 @@ def analizuj_widma_epr(X_scaled, liczba_grup):
     wyniki_klasteryzacji['CLARA'] = etykiety_clara
 
     # 5. CLARANS
-    # Parametry numlocal i maxneighbor determinują dokładność i czas działania. Ustawiamy stabilne domyślne.
     clarans_instance = clarans(dane_pyclustering, liczba_grup, numlocal=3, maxneighbor=4)
     clarans_instance.process()
     clarans_clusters = clarans_instance.get_clusters()
@@ -131,7 +148,7 @@ def generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_y=None):
 
 # --- INTERFEJS STREAMLIT ---
 st.title("🔬 Analiza i Klasteryzacja Widm EPR (Metody Partycjonujące)")
-st.markdown("Algorytmy: **K-means, K-medoids, PAM, CLARA, CLARANS**")
+st.markdown("Zaimplementowane algorytmy: **K-means, K-medoids, PAM, CLARA, CLARANS**")
 
 st.sidebar.header("Parametry algorytmów")
 liczba_grup = st.sidebar.number_input("Liczba klastrów (K):", min_value=2, max_value=20, value=3)
