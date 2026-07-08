@@ -13,7 +13,8 @@ from sklearn.decomposition import PCA
 from sklearn.mixture import GaussianMixture
 
 # Algorytmy Partycjonujące i Gęstościowe
-from sklearn.cluster import KMeans, DBSCAN, OPTICS, MeanShift, AgglomerativeClustering
+from sklearn.cluster import KMeans, DBSCAN, OPTICS, MeanShift, AgglomerativeClustering, Birch
+from sklearn.neighbors import kneighbors_graph
 import scipy.sparse as sp
 from scipy.sparse.csgraph import connected_components
 from scipy.ndimage import gaussian_filter, maximum_filter
@@ -324,6 +325,207 @@ def uruchom_mec(X, n_clusters, beta=1.0, max_iter=150):
     return np.argmax(U, axis=1)
 
 # ==========================================
+# NATYWNE IMPLEMENTACJE - TABELA 1 (Hierarchiczne)
+# SLINK / CLINK / BIRCH -> sklearn (single/complete linkage, Birch).
+# CURE / ROCK / Chameleon / DIANA / DISMEA -> implementacje natywne poniżej.
+# Uwaga: metody hierarchiczne wymagają zadanej liczby klastrów K.
+# ==========================================
+def uruchom_cure(X, liczba_grup, n_repr=5, shrink=0.3):
+    """CURE: każdy klaster reprezentowany przez zbiór rozproszonych punktów
+    obkurczonych w stronę centroidu; łączenie pary o najbliższych reprezentantach."""
+    n = X.shape[0]
+    clusters = {i: [i] for i in range(n)}
+    reps = {i: X[i:i+1].astype(float).copy() for i in range(n)}
+    while len(clusters) > liczba_grup:
+        keys = list(clusters.keys())
+        min_d, pair = np.inf, None
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                d = pairwise_distances(reps[keys[i]], reps[keys[j]]).min()
+                if d < min_d:
+                    min_d, pair = d, (keys[i], keys[j])
+        a, b = pair
+        merged = clusters[a] + clusters[b]
+        pts = X[merged]
+        center = pts.mean(axis=0)
+        # farthest-first: wybór rozproszonych reprezentantów
+        chosen = [merged[int(np.argmax(np.linalg.norm(pts - center, axis=1)))]]
+        while len(chosen) < min(n_repr, len(merged)):
+            d2 = np.min(pairwise_distances(X[merged], X[chosen]), axis=1)
+            chosen.append(merged[int(np.argmax(d2))])
+        rep_pts = X[chosen].astype(float)
+        rep_pts = rep_pts + shrink * (center - rep_pts)  # obkurczanie w stronę centroidu
+        nk = max(clusters) + 1
+        clusters[nk] = merged
+        reps[nk] = rep_pts
+        del clusters[a]; del clusters[b]; del reps[a]; del reps[b]
+    labels = np.empty(n, dtype=int)
+    for lab, members in enumerate(clusters.values()):
+        for m in members:
+            labels[m] = lab
+    return labels
+
+def uruchom_rock(X, liczba_grup, theta=0.5, k_neighbors=None):
+    """ROCK (adaptacja do danych numerycznych): sąsiedztwo = graf k-NN,
+    link(a,b) = liczba wspólnych sąsiadów, łączenie wg miary 'goodness' z f(theta).
+    Oryginalnie metoda dla danych Boolean/Categorical - dla widm używamy grafu k-NN,
+    co daje strukturę linków stabilną niezależnie od skali danych."""
+    n = X.shape[0]
+    if k_neighbors is None:
+        k_neighbors = max(2, int(np.sqrt(n)))
+    k_neighbors = min(k_neighbors, n - 1)
+    A = kneighbors_graph(X, n_neighbors=k_neighbors, mode='connectivity').toarray()
+    neigh = np.maximum(A, A.T).astype(int)  # symetryzacja grafu sąsiedztwa
+    link = neigh @ neigh.T                  # liczba wspólnych sąsiadów
+    np.fill_diagonal(link, 0)
+    clusters = {i: [i] for i in range(n)}
+    f = 1 + 2 * (1 - theta) / (1 + theta)
+    def goodness(a, b):
+        la, lb = clusters[a], clusters[b]
+        cross = link[np.ix_(la, lb)].sum()
+        na, nb = len(la), len(lb)
+        denom = (na + nb) ** f - na ** f - nb ** f
+        return cross / denom if denom > 0 else 0.0
+    while len(clusters) > liczba_grup:
+        keys = list(clusters.keys())
+        best_g, pair = 0.0, None
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                g = goodness(keys[i], keys[j])
+                if g > best_g:
+                    best_g, pair = g, (keys[i], keys[j])
+        if pair is None:
+            break  # brak linków - zatrzymanie (może pozostać > K klastrów, zgodnie z naturą ROCK)
+        a, b = pair
+        nk = max(clusters) + 1
+        clusters[nk] = clusters[a] + clusters[b]
+        del clusters[a]; del clusters[b]
+    labels = np.full(n, -1)
+    for lab, members in enumerate(clusters.values()):
+        for m in members:
+            labels[m] = lab
+    return labels
+
+def uruchom_chameleon(X, liczba_grup, k_nn=5, alpha=2.0):
+    """Chameleon (uproszczony): wstępna partycja na drobne klastry, następnie
+    aglomeracyjne łączenie wg Względnej Wzajemnej Łączności (RI) i Względnej
+    Bliskości (RC) liczonych na grafie k-NN."""
+    n = X.shape[0]
+    k_nn = min(k_nn, n - 1)
+    knn = kneighbors_graph(X, n_neighbors=k_nn, mode='distance').toarray()
+    W = np.where(knn > 0, 1.0 / (1.0 + knn), 0.0)
+    W = np.maximum(W, W.T)  # symetryczne wagi (podobieństwo)
+    m = min(max(liczba_grup * 3, liczba_grup + 1), n)
+    sub = AgglomerativeClustering(n_clusters=m).fit_predict(X)
+    clusters = {c: list(np.where(sub == c)[0]) for c in np.unique(sub)}
+
+    def cross_w(a, b):
+        blk = W[np.ix_(clusters[a], clusters[b])]
+        return blk[blk > 0]
+    def intern_w(members):
+        blk = W[np.ix_(members, members)]
+        iu = np.triu_indices(len(members), 1)
+        w = blk[iu]
+        return w[w > 0]
+
+    while len(clusters) > liczba_grup:
+        keys = list(clusters.keys())
+        best, pair = -1.0, None
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                a, b = keys[i], keys[j]
+                cw = cross_w(a, b)
+                if len(cw) == 0:
+                    continue
+                ia, ib = intern_w(clusters[a]), intern_w(clusters[b])
+                ECa = ia.sum() if len(ia) else 1e-9
+                ECb = ib.sum() if len(ib) else 1e-9
+                RI = cw.sum() / ((ECa + ECb) / 2 + 1e-9)         # Względna Łączność
+                Sab = cw.mean()
+                Sa = ia.mean() if len(ia) else Sab
+                Sb = ib.mean() if len(ib) else Sab
+                na, nb = len(clusters[a]), len(clusters[b])
+                RC = Sab / ((na / (na + nb)) * Sa + (nb / (na + nb)) * Sb + 1e-9)  # Względna Bliskość
+                score = RI * (RC ** alpha)
+                if score > best:
+                    best, pair = score, (a, b)
+        if pair is None:
+            # brak krawędzi między klastrami w grafie - łączymy najbliższe geometrycznie
+            keys = list(clusters.keys())
+            cen = {c: X[clusters[c]].mean(axis=0) for c in keys}
+            bd, pair = np.inf, (keys[0], keys[1])
+            for i in range(len(keys)):
+                for j in range(i + 1, len(keys)):
+                    d = np.linalg.norm(cen[keys[i]] - cen[keys[j]])
+                    if d < bd:
+                        bd, pair = d, (keys[i], keys[j])
+        a, b = pair
+        nk = max(clusters) + 1
+        clusters[nk] = clusters[a] + clusters[b]
+        del clusters[a]; del clusters[b]
+    labels = np.empty(n, dtype=int)
+    for lab, members in enumerate(clusters.values()):
+        for mm in members:
+            labels[mm] = lab
+    return labels
+
+def uruchom_diana(X, liczba_grup):
+    """DIANA (Divisive Analysis): iteracyjny podział klastra o największej średnicy
+    metodą 'splinter group' Macnaughton-Smitha."""
+    D = pairwise_distances(X)
+    labels = np.zeros(X.shape[0], dtype=int)
+    while len(np.unique(labels)) < liczba_grup:
+        best_c, best_diam = None, -1.0
+        for c in np.unique(labels):
+            idx = np.where(labels == c)[0]
+            if len(idx) < 2:
+                continue
+            diam = D[np.ix_(idx, idx)].max()
+            if diam > best_diam:
+                best_diam, best_c = diam, c
+        if best_c is None:
+            break
+        idx = np.where(labels == best_c)[0]
+        sub_D = D[np.ix_(idx, idx)]
+        splinter = [int(np.argmax(sub_D.mean(axis=1)))]  # punkt najbardziej odstający
+        reszta = [i for i in range(len(idx)) if i not in splinter]
+        moved = True
+        while moved and len(reszta) > 1:
+            moved = False
+            best_p, best_diff = None, 1e-12
+            for p in reszta:
+                d_spl = np.mean([sub_D[p, s] for s in splinter])
+                d_rest = np.mean([sub_D[p, r] for r in reszta if r != p])
+                if (d_rest - d_spl) > best_diff:
+                    best_diff, best_p = d_rest - d_spl, p
+            if best_p is not None:
+                splinter.append(best_p)
+                reszta.remove(best_p)
+                moved = True
+        labels[idx[splinter]] = labels.max() + 1
+    return labels
+
+def uruchom_dismea(X, liczba_grup, random_state=42):
+    """DISMEA: podziałowy - iteracyjnie dzieli najbardziej rozproszony klaster
+    (największe SSE) algorytmem 2-średnich, aż do uzyskania K klastrów."""
+    labels = np.zeros(X.shape[0], dtype=int)
+    while len(np.unique(labels)) < liczba_grup:
+        best_c, best_sse = None, -1.0
+        for c in np.unique(labels):
+            idx = np.where(labels == c)[0]
+            if len(idx) < 2:
+                continue
+            sse = ((X[idx] - X[idx].mean(axis=0)) ** 2).sum()
+            if sse > best_sse:
+                best_sse, best_c = sse, c
+        if best_c is None:
+            break
+        idx = np.where(labels == best_c)[0]
+        sub = KMeans(n_clusters=2, n_init=10, random_state=random_state).fit_predict(X[idx])
+        labels[idx[sub == 1]] = labels.max() + 1
+    return labels
+
+# ==========================================
 # GŁÓWNA LOGIKA APLIKACJI
 # ==========================================
 
@@ -370,6 +572,19 @@ def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_ko
         ostrzezenie_gt = f"Nie udało się wczytać 'Ground Truth': {e}"
 
     return X, X_scaled, df, ground_truth_labels, df_gt_preview, identyfikatory_widm, ostrzezenie_gt
+
+def analizuj_hierarchiczne(X_scaled, liczba_grup, birch_threshold=0.5, cure_repr=5,
+                            cure_shrink=0.3, rock_theta=0.5, cham_knn=5):
+    wyniki = {}
+    wyniki['SLINK'] = AgglomerativeClustering(n_clusters=liczba_grup, linkage='single').fit_predict(X_scaled)
+    wyniki['CLINK'] = AgglomerativeClustering(n_clusters=liczba_grup, linkage='complete').fit_predict(X_scaled)
+    wyniki['BIRCH'] = Birch(n_clusters=liczba_grup, threshold=birch_threshold).fit_predict(X_scaled)
+    wyniki['CURE'] = uruchom_cure(X_scaled, liczba_grup, n_repr=cure_repr, shrink=cure_shrink)
+    wyniki['ROCK'] = uruchom_rock(X_scaled, liczba_grup, theta=rock_theta)
+    wyniki['Chameleon'] = uruchom_chameleon(X_scaled, liczba_grup, k_nn=cham_knn)
+    wyniki['DIANA'] = uruchom_diana(X_scaled, liczba_grup)
+    wyniki['DISMEA'] = uruchom_dismea(X_scaled, liczba_grup)
+    return wyniki
 
 def analizuj_partycjonujace(X_scaled, liczba_grup):
     wyniki = {}
@@ -458,6 +673,7 @@ st.sidebar.header("Wybór Metodologii")
 rodzina_algorytmow = st.sidebar.radio(
     "Którą procedurę chcesz uruchomić?",
     (
+        "Hierarchiczne (Tab 1)",
         "Partycjonujące (Tab 2)",
         "Oparte na Gęstości (Tab 3)",
         "Oparte na Siatce (Tab 4)",
@@ -474,8 +690,19 @@ liczba_grup = 5
 eps_val, min_samples_val, bandwidth_val = 5.0, 3, 2.0
 bins_val = 15
 m_fuzziness, beta_mec = 2.0, 1.0
+birch_threshold, cure_repr, cure_shrink, rock_theta, cham_knn = 0.5, 5, 0.3, 0.5, 5
 
-if rodzina_algorytmow == "Partycjonujące (Tab 2)":
+if rodzina_algorytmow == "Hierarchiczne (Tab 1)":
+    st.sidebar.markdown("*Metody hierarchiczne (aglomeracyjne i podziałowe) budują drzewo klastrów; wymagają zadanej liczby K.*")
+    liczba_grup = st.sidebar.number_input("Liczba klastrów (K):", min_value=2, max_value=20, value=3)
+    with st.sidebar.expander("Parametry szczegółowe (BIRCH / CURE / ROCK / Chameleon)"):
+        birch_threshold = st.slider("BIRCH – próg (threshold):", 0.1, 5.0, 0.5, 0.1)
+        cure_repr = st.number_input("CURE – liczba reprezentantów:", 1, 20, 5)
+        cure_shrink = st.slider("CURE – współczynnik obkurczania:", 0.0, 1.0, 0.3, 0.05)
+        rock_theta = st.slider("ROCK – próg podobieństwa (\u03B8):", 0.1, 0.95, 0.5, 0.05)
+        cham_knn = st.slider("Chameleon – liczba sąsiadów k-NN:", 2, 30, 5)
+
+elif rodzina_algorytmow == "Partycjonujące (Tab 2)":
     liczba_grup = st.sidebar.number_input("Liczba klastrów (K):", min_value=2, max_value=20, value=3)
 
 elif rodzina_algorytmow == "Oparte na Gęstości (Tab 3)":
@@ -496,7 +723,14 @@ elif rodzina_algorytmow == "Rozmyte / Fuzzy (Tab 5)":
 
 elif rodzina_algorytmow == "🔥 WSZYSTKIE NA RAZ (Globalny Ranking)":
     st.sidebar.markdown("**Zestawienie Globalne (Dostęp do wszystkich parametrów)**")
-    liczba_grup = st.sidebar.number_input("Liczba klastrów (K) dla Metod Partycjonujących i Rozmytych:", min_value=2, max_value=20, value=5)
+    liczba_grup = st.sidebar.number_input("Liczba klastrów (K) dla Metod Hierarchicznych, Partycjonujących i Rozmytych:", min_value=2, max_value=20, value=5)
+
+    with st.sidebar.expander("Parametry Metod Hierarchicznych"):
+        birch_threshold = st.slider("BIRCH – próg (threshold):", 0.1, 5.0, 0.5, 0.1)
+        cure_repr = st.number_input("CURE – liczba reprezentantów:", 1, 20, 5)
+        cure_shrink = st.slider("CURE – współczynnik obkurczania:", 0.0, 1.0, 0.3, 0.05)
+        rock_theta = st.slider("ROCK – próg podobieństwa (\u03B8):", 0.1, 0.95, 0.5, 0.05)
+        cham_knn = st.slider("Chameleon – liczba sąsiadów k-NN:", 2, 30, 5)
 
     with st.sidebar.expander("Parametry Metod Gęstościowych"):
         eps_val = st.slider("Promień poszukiwań (eps):", 0.1, 20.0, 5.0, 0.1)
@@ -556,7 +790,9 @@ if wgrany_plik is not None:
                 with st.spinner('Trwa obliczanie klastrów... W trybie globalnym może to zająć chwilę.'):
 
                     wyniki = {}
-                    if rodzina_algorytmow == "Partycjonujące (Tab 2)":
+                    if rodzina_algorytmow == "Hierarchiczne (Tab 1)":
+                        wyniki.update(analizuj_hierarchiczne(X_scaled, liczba_grup, birch_threshold, cure_repr, cure_shrink, rock_theta, cham_knn))
+                    elif rodzina_algorytmow == "Partycjonujące (Tab 2)":
                         wyniki.update(analizuj_partycjonujace(X_scaled, liczba_grup))
                     elif rodzina_algorytmow == "Oparte na Gęstości (Tab 3)":
                         wyniki.update(analizuj_gestosciowe(X_scaled, eps_val, min_samples_val, bandwidth_val))
@@ -565,6 +801,7 @@ if wgrany_plik is not None:
                     elif rodzina_algorytmow == "Rozmyte / Fuzzy (Tab 5)":
                         wyniki.update(analizuj_rozmyte(X_scaled, liczba_grup, m_fuzziness, beta_mec))
                     elif rodzina_algorytmow == "🔥 WSZYSTKIE NA RAZ (Globalny Ranking)":
+                        wyniki.update(analizuj_hierarchiczne(X_scaled, liczba_grup, birch_threshold, cure_repr, cure_shrink, rock_theta, cham_knn))
                         wyniki.update(analizuj_partycjonujace(X_scaled, liczba_grup))
                         wyniki.update(analizuj_gestosciowe(X_scaled, eps_val, min_samples_val, bandwidth_val))
                         wyniki.update(analizuj_siatkowe(X_scaled, bins_val))
