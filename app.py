@@ -7,6 +7,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import adjusted_rand_score, pairwise_distances
 from sklearn.neighbors import KernelDensity
 from sklearn.decomposition import PCA
+from sklearn.mixture import GaussianMixture
 
 # Algorytmy Partycjonujące i Gęstościowe
 from sklearn.cluster import KMeans, DBSCAN, OPTICS, MeanShift, AgglomerativeClustering
@@ -115,12 +116,8 @@ def uruchom_rdbc(X, eps=0.5, min_samples=5):
 # NATYWNE IMPLEMENTACJE - TABELA 4 (Siatkowe)
 # ==========================================
 def pca_grid_base(X, bins=15):
-    """Pomocnicza redukcja wymiarów do 2D, niezbędna dla algorytmów siatkowych."""
-    if X.shape[1] >= 2:
-        X_pca = PCA(n_components=2, random_state=42).fit_transform(X)
-    else:
-        X_pca = np.column_stack((X, np.zeros_like(X))) # Fallback
-
+    if X.shape[1] >= 2: X_pca = PCA(n_components=2, random_state=42).fit_transform(X)
+    else: X_pca = np.column_stack((X, np.zeros_like(X)))
     X_min, X_max = X_pca.min(axis=0), X_pca.max(axis=0)
     X_norm = (X_pca - X_min) / (X_max - X_min + 1e-9)
     coords = np.floor(X_norm * bins).astype(int)
@@ -131,11 +128,9 @@ def pca_grid_base(X, bins=15):
 
 def uruchom_sting(X, bins=15):
     coords, flat_coords, grid_2d = pca_grid_base(X, bins)
-    threshold = (X.shape[0] / (bins*bins)) * 0.5 # Średnia gęstość jako próg
+    threshold = (X.shape[0] / (bins*bins)) * 0.5
     dense_cells = np.argwhere(grid_2d > threshold)
     if len(dense_cells) == 0: return np.full(X.shape[0], -1)
-    
-    # Łączenie sąsiadujących gęstych komórek
     cell_labels = DBSCAN(eps=1.5, min_samples=1).fit_predict(dense_cells)
     flat_to_label = np.full(bins*bins, -1)
     for idx, (i, j) in enumerate(dense_cells): flat_to_label[i * bins + j] = cell_labels[idx]
@@ -145,11 +140,9 @@ def uruchom_clique(X, bins=15):
     coords, flat_coords, grid_2d = pca_grid_base(X, bins)
     c0 = np.bincount(coords[:, 0], minlength=bins)
     c1 = np.bincount(coords[:, 1], minlength=bins)
-    
     t0, t1 = np.mean(c0), np.mean(c1)
     labels = np.full(X.shape[0], -1)
     cluster_id = 0
-    # Przecinanie gęstych podprzestrzeni (1D z 1D = 2D)
     for i in np.where(c0 > t0)[0]:
         for j in np.where(c1 > t1)[0]:
             mask = (coords[:, 0] == i) & (coords[:, 1] == j)
@@ -162,8 +155,6 @@ def uruchom_optigrid(X, bins=15):
     coords, flat_coords, grid_2d = pca_grid_base(X, bins)
     c0 = np.bincount(coords[:, 0], minlength=bins)
     c1 = np.bincount(coords[:, 1], minlength=bins)
-    
-    # Cięcie w miejscach o najmniejszej gęstości (doliny)
     cut0, cut1 = np.argmin(c0), np.argmin(c1)
     labels = np.zeros(X.shape[0], dtype=int)
     labels[coords[:, 0] > cut0] += 1
@@ -174,8 +165,6 @@ def uruchom_gridclus(X, bins=15):
     coords, flat_coords, grid_2d = pca_grid_base(X, bins)
     populated = np.argwhere(grid_2d > 0)
     if len(populated) < 2: return np.zeros(X.shape[0])
-    
-    # Aglomeracyjne grupowanie bloków siatki
     cell_labels = AgglomerativeClustering(n_clusters=min(3, len(populated))).fit_predict(populated)
     flat_to_label = np.full(bins*bins, -1)
     for idx, (i, j) in enumerate(populated): flat_to_label[i * bins + j] = cell_labels[idx]
@@ -183,34 +172,76 @@ def uruchom_gridclus(X, bins=15):
 
 def uruchom_gdilc(X, bins=15):
     coords, flat_coords, grid_2d = pca_grid_base(X, bins)
-    
-    # Poszukiwanie izolinii szczytowych (lokalne maksima)
     local_max = maximum_filter(grid_2d, size=3) == grid_2d
     peaks = np.argwhere(local_max & (grid_2d > 0))
     if len(peaks) == 0: return np.full(X.shape[0], -1)
-    
     populated = np.argwhere(grid_2d > 0)
-    # Przypisanie komórek do najbliższych szczytów gęstości (gradient ascent)
     from sklearn.metrics import pairwise_distances_argmin
     cell_labels = pairwise_distances_argmin(populated, peaks)
-    
     flat_to_label = np.full(bins*bins, -1)
     for idx, (i, j) in enumerate(populated): flat_to_label[i * bins + j] = cell_labels[idx]
     return flat_to_label[flat_coords]
 
 def uruchom_wavecluster(X, bins=15):
     coords, flat_coords, grid_2d = pca_grid_base(X, bins)
-    
-    # Transformata falkowa przybliżona filtrem Gaussa (low-pass)
     blurred = gaussian_filter(grid_2d.astype(float), sigma=1.0)
     dense_cells = np.argwhere(blurred > np.mean(blurred))
     if len(dense_cells) == 0: return np.full(X.shape[0], -1)
-    
     cell_labels = DBSCAN(eps=1.5, min_samples=1).fit_predict(dense_cells)
     flat_to_label = np.full(bins*bins, -1)
     for idx, (i, j) in enumerate(dense_cells): flat_to_label[i * bins + j] = cell_labels[idx]
     return flat_to_label[flat_coords]
 
+# ==========================================
+# NATYWNE IMPLEMENTACJE - TABELA 5 (Rozmyte/Fuzzy)
+# ==========================================
+def uruchom_fcm(X, n_clusters, m=2.0, metric='euclidean', max_iter=150, tol=1e-5):
+    """Implementacja Fuzzy C-Means (oraz wariantów). Zwraca twarde etykiety (defuzyfikacja)."""
+    np.random.seed(42)
+    n_samples = X.shape[0]
+    
+    # Inicjalizacja macierzy przynależności U (wartości od 0 do 1)
+    U = np.random.dirichlet(np.ones(n_clusters), size=n_samples)
+    
+    for _ in range(max_iter):
+        U_m = U ** m
+        # Obliczanie nowych centrów rozmytych
+        centers = (U_m.T @ X) / np.sum(U_m, axis=0)[:, None]
+        
+        # Odległość do centrów
+        dist = pairwise_distances(X, centers, metric=metric)
+        dist = np.fmax(dist, np.finfo(np.float64).eps) # Zabezpieczenie przed dzieleniem przez 0
+        
+        # Aktualizacja macierzy U
+        temp = dist ** (-2 / (m - 1))
+        U_new = temp / np.sum(temp, axis=1)[:, None]
+        
+        if np.linalg.norm(U_new - U) < tol:
+            break
+        U = U_new
+        
+    # Defuzyfikacja (wybieramy klaster o najwyższym prawdopodobieństwie)
+    return np.argmax(U, axis=1)
+
+def uruchom_mec(X, n_clusters, beta=1.0, max_iter=150):
+    """Maximum Entropy Clustering (MEC) z regularyzacją entropijną (Soft K-Means)."""
+    np.random.seed(42)
+    # Losowa inicjalizacja centrów
+    centers_idx = np.random.choice(X.shape[0], n_clusters, replace=False)
+    centers = X[centers_idx]
+    
+    for _ in range(max_iter):
+        dist = pairwise_distances(X, centers, metric='sqeuclidean')
+        # Zastosowanie rozkładu Boltzmanna / Softmax
+        temp = np.exp(-beta * dist)
+        U = temp / np.sum(temp, axis=1)[:, None]
+        
+        new_centers = (U.T @ X) / np.sum(U, axis=0)[:, None]
+        if np.allclose(centers, new_centers, atol=1e-5):
+            break
+        centers = new_centers
+        
+    return np.argmax(U, axis=1)
 
 # ==========================================
 # GŁÓWNA LOGIKA APLIKACJI
@@ -272,6 +303,27 @@ def analizuj_siatkowe(X_scaled, bins):
     wyniki['WaveCluster'] = uruchom_wavecluster(X_scaled, bins=bins)
     return wyniki
 
+def analizuj_rozmyte(X_scaled, liczba_grup, m_fuzziness, beta_mec):
+    wyniki = {}
+    # Fuzzy k-means
+    wyniki['Fuzzy k-means'] = uruchom_fcm(X_scaled, liczba_grup, m=m_fuzziness, metric='euclidean')
+    # Fuzzy k-modes (przybliżenie przez zastosowanie odległości miejskiej L1 dla danych numerycznych)
+    wyniki['Fuzzy k-modes'] = uruchom_fcm(X_scaled, liczba_grup, m=m_fuzziness, metric='manhattan')
+    # FCM (Fuzzy C-Means to standardowa nazwa k-means)
+    wyniki['FCM'] = uruchom_fcm(X_scaled, liczba_grup, m=m_fuzziness, metric='euclidean')
+    
+    # FCS (Fuzzy C-Spherical / Scatter Matrix) - Aproksymacja przez Probabilistyczny Gaussian Mixture (Spherical)
+    gmm_fcs = GaussianMixture(n_components=liczba_grup, covariance_type='spherical', random_state=42)
+    wyniki['FCS'] = gmm_fcs.fit_predict(X_scaled)
+    
+    # MM (Markov Model / Mixture Model) - GMM z diagonalną macierzą kowariancji
+    gmm_mm = GaussianMixture(n_components=liczba_grup, covariance_type='diag', random_state=42)
+    wyniki['MM'] = gmm_mm.fit_predict(X_scaled)
+    
+    # MEC (Maximum Entropy Clustering)
+    wyniki['MEC'] = uruchom_mec(X_scaled, liczba_grup, beta=beta_mec)
+    return wyniki
+
 def generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_y=None):
     fig, ax = plt.subplots(figsize=(10, 5))
     unikalne_etykiety = np.unique(etykiety)
@@ -312,7 +364,7 @@ st.title("🔬 Analiza i Klasteryzacja Widm EPR")
 st.sidebar.header("Wybór Metodologii")
 rodzina_algorytmow = st.sidebar.radio(
     "Którą rodzinę algorytmów chcesz uruchomić?",
-    ("Partycjonujące (Tab 2)", "Oparte na Gęstości (Tab 3)", "Oparte na Siatce (Tab 4)")
+    ("Partycjonujące (Tab 2)", "Oparte na Gęstości (Tab 3)", "Oparte na Siatce (Tab 4)", "Rozmyte / Fuzzy (Tab 5)")
 )
 
 st.sidebar.markdown("---")
@@ -320,24 +372,32 @@ st.sidebar.header("Parametry algorytmów")
 
 if rodzina_algorytmow == "Partycjonujące (Tab 2)":
     liczba_grup = st.sidebar.number_input("Liczba klastrów (K):", min_value=2, max_value=20, value=3)
+
 elif rodzina_algorytmow == "Oparte na Gęstości (Tab 3)":
-    st.sidebar.markdown("*Uwaga: Metody gęstościowe same znajdują optymalną liczbę klastrów.*")
-    eps_val = st.sidebar.slider("Promień poszukiwań (eps) - DBSCAN/RDBC:", min_value=0.1, max_value=20.0, value=5.0, step=0.1)
-    min_samples_val = st.sidebar.number_input("Minimalna liczba punktów (min_samples) - DBSCAN/OPTICS:", min_value=2, max_value=50, value=3)
-    bandwidth_val = st.sidebar.slider("Szerokość pasma (bandwidth) - Mean-Shift/DENCLUE:", min_value=0.1, max_value=20.0, value=2.0, step=0.1)
-else:
+    st.sidebar.markdown("*Metody gęstościowe same znajdują optymalną liczbę klastrów.*")
+    eps_val = st.sidebar.slider("Promień poszukiwań (eps):", min_value=0.1, max_value=20.0, value=5.0, step=0.1)
+    min_samples_val = st.sidebar.number_input("Minimalna liczba punktów (min_samples):", min_value=2, max_value=50, value=3)
+    bandwidth_val = st.sidebar.slider("Szerokość pasma (bandwidth):", min_value=0.1, max_value=20.0, value=2.0, step=0.1)
+
+elif rodzina_algorytmow == "Oparte na Siatce (Tab 4)":
     st.sidebar.markdown("*Metody siatkowe redukują wymiarowość widm (PCA) i dzielą przestrzeń na bloki.*")
-    bins_val = st.sidebar.slider("Rozdzielczość siatki (liczba komórek na oś):", min_value=5, max_value=50, value=15)
+    bins_val = st.sidebar.slider("Rozdzielczość siatki (komórki):", min_value=5, max_value=50, value=15)
+
+elif rodzina_algorytmow == "Rozmyte / Fuzzy (Tab 5)":
+    st.sidebar.markdown("*Algorytmy rozmyte określają prawdopodobieństwo przynależności.*")
+    liczba_grup = st.sidebar.number_input("Liczba klastrów (K):", min_value=2, max_value=20, value=3)
+    m_fuzziness = st.sidebar.slider("Współczynnik rozmycia (m) dla FCM:", min_value=1.1, max_value=5.0, value=2.0, step=0.1)
+    beta_mec = st.sidebar.slider("Parametr temperatury (\u03B2) dla MEC:", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
 
 st.sidebar.markdown("---")
-st.sidebar.header("Ustawienia danych głównego arkusza")
+st.sidebar.header("Ustawienia danych")
 pomin_kolumne = st.sidebar.checkbox("Zignoruj pierwszą kolumnę (np. oś X widma)", value=False)
 transpozycja = st.sidebar.checkbox("Transpozycja danych (widma w kolumnach)", value=False)
-limit_osi_y = st.sidebar.number_input("Maksymalna wartość osi Y na wykresach (0 = auto):", min_value=0.0, max_value=1000.0, value=0.25, step=0.05)
+limit_osi_y = st.sidebar.number_input("Limit osi Y na wykresach (0 = auto):", min_value=0.0, max_value=1000.0, value=0.25, step=0.05)
 
 st.sidebar.markdown("---")
-st.sidebar.header("Ustawienia Ground Truth")
-gt_indeks = st.sidebar.number_input("Indeks kolumny z etykietami klastrów (0 = pierwsza):", min_value=0, max_value=10, value=0)
+st.sidebar.header("Ground Truth")
+gt_indeks = st.sidebar.number_input("Indeks kolumny etykiet (0 = pierwsza):", min_value=0, max_value=10, value=0)
 
 wgrany_plik = st.file_uploader("Wybierz plik Excel (.xlsx)", type=['xlsx'])
 
@@ -370,8 +430,10 @@ if wgrany_plik is not None:
                         wyniki = analizuj_partycjonujace(X_scaled, liczba_grup)
                     elif rodzina_algorytmow == "Oparte na Gęstości (Tab 3)":
                         wyniki = analizuj_gestosciowe(X_scaled, eps_val, min_samples_val, bandwidth_val)
-                    else:
+                    elif rodzina_algorytmow == "Oparte na Siatce (Tab 4)":
                         wyniki = analizuj_siatkowe(X_scaled, bins_val)
+                    elif rodzina_algorytmow == "Rozmyte / Fuzzy (Tab 5)":
+                        wyniki = analizuj_rozmyte(X_scaled, liczba_grup, m_fuzziness, beta_mec)
                         
                     wykresy = {}
                     wyniki_ewaluacji = []
