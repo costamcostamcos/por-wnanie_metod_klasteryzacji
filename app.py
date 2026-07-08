@@ -1,20 +1,4 @@
-import subprocess
-import sys
 import streamlit as st
-
-# --- BRUTALNE WYMUSZENIE INSTALACJI PYCLUSTERING ---
-@st.cache_resource
-def zainstaluj_braki():
-    try:
-        import pyclustering
-    except ImportError:
-        print("Instalowanie pyclustering w locie...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "pyclustering"])
-
-# Uruchomienie funkcji zanim skrypt przejdzie do właściwych importów
-zainstaluj_braki()
-# ---------------------------------------------------
-
 import pandas as pd
 import numpy as np
 import io
@@ -22,13 +6,98 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn_extra.cluster import KMedoids
-from sklearn.metrics import adjusted_rand_score
-
-# Zwykłe importy pyclustering po upewnieniu się, że biblioteka istnieje
-from pyclustering.cluster.clara import clara
-from pyclustering.cluster.clarans import clarans
+from sklearn.metrics import adjusted_rand_score, pairwise_distances
 
 st.set_page_config(page_title="Klasteryzacja Widm EPR - Metody Partycjonujące", layout="wide")
+
+# ==========================================
+# WŁASNE IMPLEMENTACJE BRAKUJĄCYCH ALGORYTMÓW
+# ==========================================
+
+def uruchom_clara(X, liczba_grup, random_state=42):
+    """Natywna implementacja algorytmu CLARA na bazie PAM."""
+    np.random.seed(random_state)
+    n_total = len(X)
+    
+    # CLARA losuje próbki. Optymalny rozmiar to 40 + 2k
+    n_samples = min(n_total, 40 + 2 * liczba_grup)
+    
+    najlepsze_medoidy = None
+    najmniejszy_koszt = float('inf')
+    
+    dist_matrix_full = pairwise_distances(X)
+    
+    # Standardowo 5 iteracji próbkowania
+    for _ in range(5): 
+        probka_idx = np.random.choice(n_total, n_samples, replace=False)
+        probka_X = X[probka_idx]
+        
+        # Uruchamiamy klasyczny PAM na mniejszej próbce
+        pam = KMedoids(n_clusters=liczba_grup, method='pam', init='heuristic').fit(probka_X)
+        medoidy_w_probce = probka_idx[pam.medoid_indices_] 
+        
+        # Obliczamy koszt (dystans) dla CAŁEGO zbioru danych
+        koszt = np.sum(np.min(dist_matrix_full[:, medoidy_w_probce], axis=1))
+        
+        if koszt < najmniejszy_koszt:
+            najmniejszy_koszt = koszt
+            najlepsze_medoidy = medoidy_w_probce
+            
+    # Ostateczne przypisanie wszystkich punktów do najlepszych medoidów
+    labels = np.argmin(dist_matrix_full[:, najlepsze_medoidy], axis=1)
+    return labels
+
+def uruchom_clarans(X, liczba_grup, numlocal=3, maxneighbor=5, random_state=42):
+    """Natywna implementacja algorytmu CLARANS."""
+    np.random.seed(random_state)
+    n_total = len(X)
+    dist_matrix = pairwise_distances(X)
+    
+    najlepsze_medoidy = None
+    najmniejszy_koszt = float('inf')
+    
+    for _ in range(numlocal):
+        # 1. Wybierz losowe medoidy na start
+        obecne_medoidy = list(np.random.choice(n_total, liczba_grup, replace=False))
+        
+        def oblicz_koszt(medoidy):
+            return np.sum(np.min(dist_matrix[:, medoidy], axis=1))
+            
+        obecny_koszt = oblicz_koszt(obecne_medoidy)
+        
+        j = 0
+        while j < maxneighbor:
+            # 2. Wybierz losowy medoid do podmiany
+            m_idx = np.random.randint(liczba_grup)
+            stary_medoid = obecne_medoidy[m_idx]
+            
+            # 3. Wybierz losowy punkt, który nie jest medoidem
+            nowy_medoid = np.random.randint(n_total)
+            while nowy_medoid in obecne_medoidy:
+                nowy_medoid = np.random.randint(n_total)
+                
+            # 4. Sprawdź koszt po podmianie
+            obecne_medoidy[m_idx] = nowy_medoid
+            nowy_koszt = oblicz_koszt(obecne_medoidy)
+            
+            if nowy_koszt < obecny_koszt:
+                obecny_koszt = nowy_koszt
+                j = 0 # Znaleziono poprawę, resetujemy licznik prób
+            else:
+                obecne_medoidy[m_idx] = stary_medoid # Wycofaj zmianę
+                j += 1
+                
+        # 5. Aktualizacja najlepszego wyniku
+        if obecny_koszt < najmniejszy_koszt:
+            najmniejszy_koszt = obecny_koszt
+            najlepsze_medoidy = list(obecne_medoidy)
+            
+    labels = np.argmin(dist_matrix[:, najlepsze_medoidy], axis=1)
+    return labels
+
+# ==========================================
+# GŁÓWNA LOGIKA APLIKACJI
+# ==========================================
 
 def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_kolumny):
     df = pd.read_excel(plik_excel, sheet_name=0)
@@ -40,7 +109,6 @@ def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_ko
         
     if transponuj:
         X_df = X_df.T
-        # Po transpozycji indeksy (dawne nagłówki kolumn) stają się nazwami widm
         identyfikatory_widm = X_df.index.astype(str).tolist()
     else:
         if pomin_kolumne:
@@ -48,7 +116,6 @@ def wczytaj_i_przygotuj_dane(plik_excel, pomin_kolumne, transponuj, gt_indeks_ko
         else:
             identyfikatory_widm = [f"Widmo_{i+1}" for i in range(X_df.shape[0])]
         
-    # Czyszczenie błędów typu '#REF!'
     X_df = X_df.apply(pd.to_numeric, errors='coerce').fillna(0)
     X = X_df.values
         
@@ -73,39 +140,19 @@ def analizuj_widma_epr(X_scaled, liczba_grup):
     kmeans = KMeans(n_clusters=liczba_grup, random_state=42)
     wyniki_klasteryzacji['K-Means'] = kmeans.fit_predict(X_scaled)
     
-    # 2. K-Medoids (Alternatywna implementacja PAM)
+    # 2. K-Medoids (Alternatywny)
     kmedoids = KMedoids(n_clusters=liczba_grup, method='alternate', random_state=42)
     wyniki_klasteryzacji['K-Medoids'] = kmedoids.fit_predict(X_scaled)
 
-    # 3. PAM (Partitioning Around Medoids)
+    # 3. PAM
     pam = KMedoids(n_clusters=liczba_grup, method='pam', random_state=42)
     wyniki_klasteryzacji['PAM'] = pam.fit_predict(X_scaled)
     
-    # Przygotowanie danych dla biblioteki pyclustering (wymaga formatu listy list)
-    dane_pyclustering = X_scaled.tolist()
-    
-    # 4. CLARA
-    rozmiar_probki_clara = min(len(dane_pyclustering), 40 + 2 * liczba_grup)
-    clara_instance = clara(dane_pyclustering, liczba_grup, rozmiar_probki_clara)
-    clara_instance.process()
-    clara_clusters = clara_instance.get_clusters()
-    
-    etykiety_clara = np.zeros(X_scaled.shape[0], dtype=int)
-    for id_klastra, klaster in enumerate(clara_clusters):
-        for id_punktu in klaster:
-            etykiety_clara[id_punktu] = id_klastra
-    wyniki_klasteryzacji['CLARA'] = etykiety_clara
+    # 4. CLARA (Nasza natywna funkcja)
+    wyniki_klasteryzacji['CLARA'] = uruchom_clara(X_scaled, liczba_grup)
 
-    # 5. CLARANS
-    clarans_instance = clarans(dane_pyclustering, liczba_grup, numlocal=3, maxneighbor=4)
-    clarans_instance.process()
-    clarans_clusters = clarans_instance.get_clusters()
-    
-    etykiety_clarans = np.zeros(X_scaled.shape[0], dtype=int)
-    for id_klastra, klaster in enumerate(clarans_clusters):
-        for id_punktu in klaster:
-            etykiety_clarans[id_punktu] = id_klastra
-    wyniki_klasteryzacji['CLARANS'] = etykiety_clarans
+    # 5. CLARANS (Nasza natywna funkcja)
+    wyniki_klasteryzacji['CLARANS'] = uruchom_clarans(X_scaled, liczba_grup)
 
     return wyniki_klasteryzacji
 
@@ -131,7 +178,7 @@ def generuj_wykres_srednich(X, etykiety, nazwa_algorytmu, limit_y=None):
             kolor = line[0].get_color()
             ax.fill_between(os_x, srednie_widmo - odchylenie, srednie_widmo + odchylenie, color=kolor, alpha=0.2)
             
-    ax.set_title(f'Średnia reprezentacja klastrów: {nazwa_algorytmu} (wstęga = $\pm$1 odchylenie std)')
+    ax.set_title(f'Średnia reprezentacja klastrów: {nazwa_algorytmu} (wstęga = $\pm$1 odch. std)')
     ax.set_xlabel('Punkt pomiarowy')
     ax.set_ylabel('Średnie natężenie')
     
@@ -185,14 +232,12 @@ if wgrany_plik is not None:
                     st.markdown(f"**Etykiety wczytane z kolumny {gt_indeks}:**")
                     st.write(gt_labels[:10])
                     st.markdown(f"*Liczba unikalnych etykiet: {len(np.unique(gt_labels))}*")
-                    if len(np.unique(gt_labels)) > 20:
-                        st.error("⚠️ UWAGA! Wykryto bardzo dużo unikalnych etykiet. Zmień indeks kolumny w panelu bocznym!")
         
         if st.button("Uruchom Klasteryzację", type="primary"):
             if gt_labels is not None and len(gt_labels) != X.shape[0]:
                 st.error(f"❌ Błąd zgodności! Ground Truth (ilość: {len(gt_labels)}) nie pasuje do badanych widm ({X.shape[0]}).")
             else:
-                with st.spinner('Trwa obliczanie klastrów (CLARANS może chwilę potrwać) i ewaluacja...'):
+                with st.spinner('Trwa obliczanie klastrów i ewaluacja...'):
                     wyniki = analizuj_widma_epr(X_scaled, liczba_grup)
                     wykresy = {}
                     wyniki_ewaluacji = []
